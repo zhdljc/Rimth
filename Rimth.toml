@@ -1,0 +1,207 @@
+# ============================================================
+# Rimth Configuration File
+# ============================================================
+# Edit the values below and restart Rimth.
+# ============================================================
+
+
+# ------------------------------------------------------------
+# Groq API settings
+# ------------------------------------------------------------
+[groq]
+# Your Groq API key. Get one at https://console.groq.com/keys
+api_key = ""
+
+# Active speech-to-text model
+# Options: whisper-large-v3-turbo (fast, cheap), whisper-large-v3 (accurate)
+stt_model = "whisper-large-v3-turbo"
+
+# Active chat / LLM model
+# Options: openai/gpt-oss-20b, openai/gpt-oss-120b,
+#          qwen/qwen3.8-27b, groq/compound, groq/compound-mini
+llm_model = "openai/gpt-oss-20b"
+
+# Active text-to-speech model
+# Options: canopylabs/orpheus-v1-english, canopylabs/orpheus-arabic-saudi
+# Requires terms acceptance at:
+# https://console.groq.com/playground?model=canopylabs%2Forpheus-v1-english
+tts_model = "canopylabs/orpheus-v1-english"
+
+# Active TTS voice persona
+# Options: troy, hannah, autumn, diana, austin, daniel
+tts_voice = "autumn"
+
+# Language for STT (ISO 639-1)
+# Examples: zh, en, ja, ko, fr, de, es, ru, ar
+language = "zh"
+
+# System prompt for the LLM
+system_prompt = "You are Rimth, a witty voice assistant on a speaker. Keep answers concise and conversational, with a light touch of humor. You can control volume, run terminal commands, fetch URLs, control the LED, set alarms, and switch models. Always reply in the user's language. Output plain prose only, no markdown, no tables, no emojis, because the reply will be spoken via TTS."
+
+# Models the AI can switch to via the switch_model tool.
+# These lists are shown to the AI so it knows what is available.
+stt_models_available = [
+    "whisper-large-v3-turbo",
+    "whisper-large-v3",
+]
+
+llm_models_available = [
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.8-27b",
+    "groq/compound",
+    "groq/compound-mini",
+]
+
+tts_models_available = [
+    "canopylabs/orpheus-v1-english",
+    "canopylabs/orpheus-arabic-saudi",
+]
+
+tts_voices_available = [
+    "troy",
+    "hannah",
+    "autumn",
+    "diana",
+    "austin",
+    "daniel",
+]
+
+
+# ------------------------------------------------------------
+# Audio / VAD settings
+# ------------------------------------------------------------
+[audio]
+# RMS threshold to trigger recording (lower = more sensitive)
+trigger_threshold = 0.05
+
+# RMS threshold below which audio is silence
+silence_threshold = 0.005
+
+# Silence duration in milliseconds before recording stops
+silence_duration_ms = 2000
+
+# Minimum recording length in milliseconds
+min_recording_ms = 1000
+
+# Microphone sample rate in Hz
+sample_rate = 16000
+
+# ALSA mixer control name for playback volume.
+# For XiaoAi LX06, the correct control is "mysoftvol"
+mixer_control = "mysoftvol"
+
+# ALSA mixer control name for microphone gain (if available).
+# LX06 uses "mysoftvol" for both playback and capture.
+mic_mixer_control = "mysoftvol"
+
+# Maximum volume percentage (0-100)
+max_volume = 80
+
+# ALSA card index (usually 0)
+card_index = 0
+
+# Software microphone gain multiplier (0.1 - 10.0)
+# Increase if the mic is too quiet, decrease if it clips.
+mic_gain = 1.0
+
+
+# ------------------------------------------------------------
+# GPIO mute button (legacy, disabled for LX06)
+# ------------------------------------------------------------
+# LX06 uses /dev/input/event0 instead of GPIO. Leave disabled.
+[gpio]
+mute_pin = 0
+enabled = false
+
+
+# ------------------------------------------------------------
+# Hardware key mapping (via /dev/input/event0)
+# ------------------------------------------------------------
+[keys]
+# Enable key listener
+enabled = true
+
+# Input device node
+device = "/dev/input/event0"
+
+# Key codes observed on XiaoAi LX06
+#   mute          = 102
+#   volume up     = 139
+#   volume down   = 115
+#   play/pause    = 114
+mute = 102
+volume_up = 139
+volume_down = 115
+play_pause = 114
+
+# Volume step percentage for each press of vol+/vol-
+volume_step = 5
+
+
+# ------------------------------------------------------------
+# Network proxy (required for CN/HK region)
+# ------------------------------------------------------------
+[proxy]
+# Leave empty for direct connection.
+# For China/HK region, a proxy is required to reach Groq API.
+#
+# Examples:
+#   url = "socks5://127.0.0.1:1080"
+#   url = "socks5h://127.0.0.1:1080"
+#   url = "http://127.0.0.1:8080"
+#   url = "http://192.168.1.133:1080"
+url = ""
+
+
+# ------------------------------------------------------------
+# Session persistence
+# ------------------------------------------------------------
+[session]
+# Directory for saved sessions
+# Empty string = auto (executable directory + /sessions)
+persist_dir = ""
+
+# Maximum number of messages kept in history (excluding system prompt)
+max_history = 50
+
+
+# ------------------------------------------------------------
+# Diagnostics
+# ------------------------------------------------------------
+[diagnostics]
+# Run device diagnostics on startup
+run_on_startup = true
+
+# Also test TTS roundtrip during diagnostics (uses API credits)
+test_tts_on_startup = false
+
+
+# ------------------------------------------------------------
+# RGB LED control
+# ------------------------------------------------------------
+[led]
+# Enable LED control (uses sysfs or i2cset)
+enabled = true
+
+# Path to the LED sysfs device
+# Common: /sys/class/leds/xiaomi:rgb:status
+device = "/sys/class/leds/xiaomi:rgb:status"
+
+# Colors as RRGGBB hex strings
+# Idle: blue
+idle_color = "0000FF"
+# Listening: green
+listening_color = "00FF00"
+# Speaking: red
+speaking_color = "FF0000"
+# Muted: magenta
+muted_color = "FF00FF"
+
+
+# ------------------------------------------------------------
+# Alarm storage
+# ------------------------------------------------------------
+[alarm]
+# Path to the alarms JSON file
+store_path = "/data/rimth/alarms.json"

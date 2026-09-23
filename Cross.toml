@@ -1,0 +1,6 @@
+[target.armv7-unknown-linux-gnueabihf]
+image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:0.2.5"
+pre-build = [
+    "dpkg --add-architecture armhf",
+    "apt-get update && apt-get install -y --no-install-recommends libasound2-dev:armhf"
+]
