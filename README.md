@@ -278,34 +278,6 @@ On first run, `Rimth.toml` is generated automatically. Edit it to set `groq.api_
 
 ## Configuration
 
-```toml
-[groq]
-api_key = "gsk_..."
-llm_model = "openai/gpt-oss-20b"
-tts_voice = "autumn"
-language = "zh"
-
-[audio]
-mixer_control = "mysoftvol"
-mic_gain = 1.0
-
-[keys]
-mute = 102
-volume_up = 139
-volume_down = 115
-play_pause = 114
-
-[proxy]
-url = "http://192.168.1.133:1080"
-
-[led]
-enabled = true
-idle_color = "0000FF"
-listening_color = "00FF00"
-speaking_color = "FF0000"
-muted_color = "FF00FF"
-```
-
 See [Rimth.toml](Rimth.toml) for the full configuration reference.
 
 ## Testing
@@ -575,3 +547,5 @@ AGPL
 - [duhow/xiaoai-patch](https://github.com/duhow/xiaoai-patch) - XiaoAi speaker patch firmware
 - [Groq](https://groq.com/) - Ultra-low-latency inference platform
 - [cpal](https://github.com/RustAudio/cpal), [hound](https://github.com/ruuda/hound), [reqwest](https://github.com/seanmonstar/reqwest)
+
+Awa - zhdljc|Tarn - \
