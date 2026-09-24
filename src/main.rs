@@ -5,14 +5,6 @@
 // it under the terms of the GNU Affero General Public License as published
 // by the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -23,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::mpsc::{channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::RwLock;
@@ -95,10 +87,7 @@ struct AudioConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct GpioConfig {
-    mute_pin: u64,
-    enabled: bool,
-}
+struct GpioConfig { mute_pin: u64, enabled: bool }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct KeysConfig {
@@ -212,7 +201,7 @@ impl Default for Config {
 }
 
 // ---------------------------------------------------------------------------
-// Chat / API data structures
+// Chat data structures
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,18 +218,10 @@ struct ChatMessage {
 }
 
 impl ChatMessage {
-    fn system(content: String) -> Self {
-        Self { role: "system".into(), content: Some(content), tool_calls: None, tool_call_id: None, name: None }
-    }
-    fn user(content: String) -> Self {
-        Self { role: "user".into(), content: Some(content), tool_calls: None, tool_call_id: None, name: None }
-    }
-    fn assistant(content: Option<String>, tool_calls: Option<Vec<ToolCall>>) -> Self {
-        Self { role: "assistant".into(), content, tool_calls, tool_call_id: None, name: None }
-    }
-    fn tool(tool_call_id: String, name: String, content: String) -> Self {
-        Self { role: "tool".into(), content: Some(content), tool_calls: None, tool_call_id: Some(tool_call_id), name: Some(name) }
-    }
+    fn system(content: String) -> Self { Self { role: "system".into(), content: Some(content), tool_calls: None, tool_call_id: None, name: None } }
+    fn user(content: String) -> Self { Self { role: "user".into(), content: Some(content), tool_calls: None, tool_call_id: None, name: None } }
+    fn assistant(content: Option<String>, tool_calls: Option<Vec<ToolCall>>) -> Self { Self { role: "assistant".into(), content, tool_calls, tool_call_id: None, name: None } }
+    fn tool(tool_call_id: String, name: String, content: String) -> Self { Self { role: "tool".into(), content: Some(content), tool_calls: None, tool_call_id: Some(tool_call_id), name: Some(name) } }
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,18 +234,10 @@ struct ChatResponse { choices: Vec<ChatChoice> }
 struct ChatChoice { message: ChatMessageResponse }
 
 #[derive(Debug, Deserialize)]
-struct ChatMessageResponse {
-    content: Option<String>,
-    tool_calls: Option<Vec<ToolCall>>,
-}
+struct ChatMessageResponse { content: Option<String>, tool_calls: Option<Vec<ToolCall>> }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ToolCall {
-    id: String,
-    #[serde(rename = "type")]
-    call_type: String,
-    function: FunctionCall,
-}
+struct ToolCall { id: String, #[serde(rename = "type")] call_type: String, function: FunctionCall }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FunctionCall { name: String, arguments: String }
@@ -292,20 +265,14 @@ enum DiagnosticResult { Ok(String), Warn(String), Fail(String) }
 
 impl DiagnosticResult {
     fn print(&self, label: &str) {
-        let tag = match self {
-            DiagnosticResult::Ok(_) => "OK",
-            DiagnosticResult::Warn(_) => "WARN",
-            DiagnosticResult::Fail(_) => "FAIL",
-        };
-        let msg = match self {
-            DiagnosticResult::Ok(m) | DiagnosticResult::Warn(m) | DiagnosticResult::Fail(m) => m,
-        };
+        let tag = match self { DiagnosticResult::Ok(_) => "OK", DiagnosticResult::Warn(_) => "WARN", DiagnosticResult::Fail(_) => "FAIL" };
+        let msg = match self { DiagnosticResult::Ok(m) | DiagnosticResult::Warn(m) | DiagnosticResult::Fail(m) => m };
         println!("  [{:4}] {:<28} {}", tag, label, msg);
     }
 }
 
 // ---------------------------------------------------------------------------
-// LED subsystem
+// LED
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,9 +293,7 @@ enum LedCommand {
 struct LedHandle { tx: Option<UnboundedSender<LedCommand>> }
 
 impl LedHandle {
-    fn send(&self, cmd: LedCommand) {
-        if let Some(tx) = &self.tx { let _ = tx.send(cmd); }
-    }
+    fn send(&self, cmd: LedCommand) { if let Some(tx) = &self.tx { let _ = tx.send(cmd); } }
 }
 
 fn parse_rgb_hex_to_bgr(s: &str) -> Option<u32> {
@@ -340,12 +305,15 @@ fn parse_rgb_hex_to_bgr(s: &str) -> Option<u32> {
     Some((b << 16) | (g << 8) | r)
 }
 
+/// The AW20054 sysfs driver processes exactly one LED per write syscall.
+/// Writing all 18 lines in one call only affects the first LED, so we
+/// issue 18 separate writes.
 fn write_leds(path: &str, colors: &[u32; LED_COUNT]) -> Result<()> {
-    let mut buf = String::with_capacity(LED_COUNT * 16);
     for (i, c) in colors.iter().enumerate() {
-        buf.push_str(&format!("{} 0x{:06X}\n", i, c));
+        let payload = format!("{} 0x{:06X}\n", i, c);
+        std::fs::write(path, payload).with_context(|| format!("LED write failed at index {}", i))?;
     }
-    std::fs::write(path, buf).context("Failed to write LED state")
+    Ok(())
 }
 
 fn step_toward(cur: u32, tgt: u32, step: u8) -> u32 {
@@ -387,7 +355,6 @@ async fn led_worker(mut rx: UnboundedReceiver<LedCommand>, config: LedConfig) {
         while rx.recv().await.is_some() {}
         return;
     }
-
     if !PathBuf::from(&config.device).exists() {
         warn!("LED device {} not found, disabling LED worker", config.device);
         while rx.recv().await.is_some() {}
@@ -421,10 +388,7 @@ async fn led_worker(mut rx: UnboundedReceiver<LedCommand>, config: LedConfig) {
                         let c = state_to_color(s, &config);
                         for i in 0..LED_COUNT { target[i] = c; }
                     }
-                    Some(LedCommand::StartThinking) => {
-                        thinking = true;
-                        thinking_phase = 0;
-                    }
+                    Some(LedCommand::StartThinking) => { thinking = true; thinking_phase = 0; }
                     Some(LedCommand::StopThinking) => {
                         thinking = false;
                         let c = state_to_color(current_state, &config);
@@ -439,9 +403,7 @@ async fn led_worker(mut rx: UnboundedReceiver<LedCommand>, config: LedConfig) {
                     }
                     Some(LedCommand::SetOneHex(idx, hex)) => {
                         if idx < LED_COUNT {
-                            if let Some(bgr) = parse_rgb_hex_to_bgr(&hex) {
-                                target[idx] = bgr;
-                            }
+                            if let Some(bgr) = parse_rgb_hex_to_bgr(&hex) { target[idx] = bgr; }
                         }
                     }
                     Some(LedCommand::Off) => {
@@ -459,24 +421,18 @@ async fn led_worker(mut rx: UnboundedReceiver<LedCommand>, config: LedConfig) {
                     for i in 0..LED_COUNT {
                         let dist = (i as i32 - head).rem_euclid(LED_COUNT as i32);
                         let dist = if dist > (LED_COUNT as i32) / 2 { LED_COUNT as i32 - dist } else { dist };
-                        let intensity: u32 = match dist {
-                            0 => 255, 1 => 170, 2 => 100, 3 => 55, 4 => 30, _ => 12,
-                        };
+                        let intensity: u32 = match dist { 0 => 255, 1 => 170, 2 => 100, 3 => 55, 4 => 30, _ => 12 };
                         let factor = intensity * 100 / 255;
                         target[i] = apply_brightness(think_bgr, factor.min(100) as u8);
                     }
                 }
-
                 let mut changed = false;
                 for i in 0..LED_COUNT {
-                    let cur = current[i];
-                    let tgt = target[i];
-                    if cur != tgt {
-                        current[i] = step_toward(cur, tgt, 18);
+                    if current[i] != target[i] {
+                        current[i] = step_toward(current[i], target[i], 18);
                         changed = true;
                     }
                 }
-
                 if changed || thinking {
                     let mut out = [0u32; LED_COUNT];
                     for i in 0..LED_COUNT {
@@ -486,9 +442,8 @@ async fn led_worker(mut rx: UnboundedReceiver<LedCommand>, config: LedConfig) {
                         Ok(_) => { consecutive_failures = 0; }
                         Err(e) => {
                             consecutive_failures += 1;
-                            if consecutive_failures == 1 {
-                                warn!("LED write failed: {}", e);
-                            } else if consecutive_failures >= LED_MAX_CONSECUTIVE_FAILURES {
+                            if consecutive_failures == 1 { warn!("LED write failed: {}", e); }
+                            else if consecutive_failures >= LED_MAX_CONSECUTIVE_FAILURES {
                                 warn!("LED disabled after {} consecutive failures", consecutive_failures);
                                 return;
                             }
@@ -498,39 +453,47 @@ async fn led_worker(mut rx: UnboundedReceiver<LedCommand>, config: LedConfig) {
             }
         }
     }
-
     info!("LED worker stopped");
 }
 
 fn spawn_led_worker(config: LedConfig) -> LedHandle {
-    if !config.enabled {
-        return LedHandle { tx: None };
-    }
+    if !config.enabled { return LedHandle { tx: None }; }
     let (tx, rx) = unbounded_channel();
     tokio::spawn(led_worker(rx, config));
     LedHandle { tx: Some(tx) }
 }
 
 // ---------------------------------------------------------------------------
-// Global state
+// Capture context
 // ---------------------------------------------------------------------------
 
-struct KeyState {
-    muted: Arc<AtomicBool>,
-    stop_playback: Arc<AtomicBool>,
-    conversation_mode: Arc<AtomicBool>,
-}
-
-struct AppState {
-    key_state: Arc<KeyState>,
-    sessions_dir: PathBuf,
+struct CaptureCtx {
+    inner: Arc<StdMutex<Option<Stream>>>,
+    tx: Sender<Vec<f32>>,
+    sample_rate: u32,
     mic_gain: Arc<AtomicU32>,
-    led: LedHandle,
-    groq: SharedGroq,
+}
+
+impl CaptureCtx {
+    fn new(tx: Sender<Vec<f32>>, sample_rate: u32, mic_gain: Arc<AtomicU32>) -> Result<Self> {
+        let stream = start_capture(tx.clone(), sample_rate, mic_gain.clone())?;
+        Ok(Self { inner: Arc::new(StdMutex::new(Some(stream))), tx, sample_rate, mic_gain })
+    }
+
+    /// Drop the current input stream, wait for ALSA to release the device,
+    /// then create a fresh stream. Called after every TTS playback to
+    /// unblock the input side, which aplay's exclusive access suspends.
+    fn restart(&self) -> Result<()> {
+        { let mut g = self.inner.lock().unwrap(); *g = None; }
+        std::thread::sleep(Duration::from_millis(60));
+        let new_stream = start_capture(self.tx.clone(), self.sample_rate, self.mic_gain.clone())?;
+        { let mut g = self.inner.lock().unwrap(); *g = Some(new_stream); }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Paths and utilities
+// Paths / utilities
 // ---------------------------------------------------------------------------
 
 fn exe_dir() -> Result<PathBuf> {
@@ -572,48 +535,35 @@ fn parse_volume(stdout: &str) -> Option<u32> {
 
 fn local_time_hm() -> Option<String> {
     std::process::Command::new("date").arg("+%H:%M").output().ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
+        .and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_string())
 }
-
 fn local_date() -> Option<String> {
     std::process::Command::new("date").arg("+%Y-%m-%d").output().ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
+        .and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_string())
 }
-
 fn local_weekday() -> u8 {
     std::process::Command::new("date").arg("+%u").output().ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse::<u8>().ok())
-        .unwrap_or(0)
+        .and_then(|s| s.trim().parse::<u8>().ok()).unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
-// Alarm management
+// Alarms
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Alarm {
-    id: String, time: String, label: String, repeat: String, enabled: bool,
-}
+struct Alarm { id: String, time: String, label: String, repeat: String, enabled: bool }
 
 fn load_alarms(path: &str) -> Vec<Alarm> {
     if let Ok(content) = std::fs::read_to_string(path) {
-        if let Ok(alarms) = serde_json::from_str::<Vec<Alarm>>(&content) {
-            return alarms;
-        }
+        if let Ok(alarms) = serde_json::from_str::<Vec<Alarm>>(&content) { return alarms; }
     }
     Vec::new()
 }
 
 fn save_alarms(path: &str, alarms: &[Alarm]) {
-    if let Some(parent) = PathBuf::from(path).parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(content) = serde_json::to_string_pretty(alarms) {
-        let _ = std::fs::write(path, content);
-    }
+    if let Some(parent) = PathBuf::from(path).parent() { let _ = std::fs::create_dir_all(parent); }
+    if let Ok(content) = serde_json::to_string_pretty(alarms) { let _ = std::fs::write(path, content); }
 }
 
 fn add_alarm(path: &str, time: &str, label: &str, repeat: &str) -> String {
@@ -622,10 +572,7 @@ fn add_alarm(path: &str, time: &str, label: &str, repeat: &str) -> String {
     loop {
         let candidate = format!("alarm_{}", n);
         if !alarms.iter().any(|a| a.id == candidate) {
-            alarms.push(Alarm {
-                id: candidate.clone(), time: time.to_string(),
-                label: label.to_string(), repeat: repeat.to_string(), enabled: true,
-            });
+            alarms.push(Alarm { id: candidate.clone(), time: time.to_string(), label: label.to_string(), repeat: repeat.to_string(), enabled: true });
             save_alarms(path, &alarms);
             return format!("Alarm set for {} ({}, id {})", time, label, candidate);
         }
@@ -637,21 +584,14 @@ fn delete_alarm(path: &str, id: &str) -> String {
     let mut alarms = load_alarms(path);
     let before = alarms.len();
     alarms.retain(|a| a.id != id);
-    if alarms.len() < before {
-        save_alarms(path, &alarms);
-        format!("Alarm {} deleted", id)
-    } else {
-        format!("Alarm {} not found", id)
-    }
+    if alarms.len() < before { save_alarms(path, &alarms); format!("Alarm {} deleted", id) }
+    else { format!("Alarm {} not found", id) }
 }
 
 fn list_alarms_text(path: &str) -> String {
     let alarms = load_alarms(path);
     if alarms.is_empty() { return "No alarms set".into(); }
-    alarms.iter()
-        .map(|a| format!("{}: {} {} ({})", a.id, a.time, a.label, a.repeat))
-        .collect::<Vec<_>>()
-        .join("; ")
+    alarms.iter().map(|a| format!("{}: {} {} ({})", a.id, a.time, a.label, a.repeat)).collect::<Vec<_>>().join("; ")
 }
 
 // ---------------------------------------------------------------------------
@@ -663,16 +603,10 @@ fn strip_markdown(text: &str) -> String {
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '*' | '`' | '~' | '_' => {
-                while let Some(&n) = chars.peek() {
-                    if n == c { chars.next(); } else { break; }
-                }
-            }
+            '*' | '`' | '~' | '_' => { while let Some(&n) = chars.peek() { if n == c { chars.next(); } else { break; } } }
             '#' => {
                 if out.ends_with('\n') || out.is_empty() {
-                    while let Some(&n) = chars.peek() {
-                        if n == '#' || n == ' ' { chars.next(); } else { break; }
-                    }
+                    while let Some(&n) = chars.peek() { if n == '#' || n == ' ' { chars.next(); } else { break; } }
                 }
             }
             '|' => out.push(' '),
@@ -688,13 +622,8 @@ fn strip_markdown(text: &str) -> String {
     let mut collapsed = String::with_capacity(out.len());
     let mut last_space = false;
     for c in out.chars() {
-        if c == ' ' {
-            if !last_space { collapsed.push(' '); }
-            last_space = true;
-        } else {
-            collapsed.push(c);
-            last_space = false;
-        }
+        if c == ' ' { if !last_space { collapsed.push(' '); } last_space = true; }
+        else { collapsed.push(c); last_space = false; }
     }
     collapsed.trim().to_string()
 }
@@ -705,9 +634,7 @@ fn split_text_for_tts(text: &str, max_chars: usize) -> Vec<String> {
     for c in text.chars() {
         current.push(c);
         if current.chars().count() >= max_chars {
-            let cut_pos = current.rfind(|ch: char| {
-                matches!(ch, '。' | '！' | '？' | '.' | '!' | '?' | ';' | '；' | '\n' | '，' | ',' | ' ')
-            });
+            let cut_pos = current.rfind(|ch: char| matches!(ch, '。' | '！' | '？' | '.' | '!' | '?' | ';' | '；' | '\n' | '，' | ',' | ' '));
             if let Some(pos) = cut_pos {
                 let byte_pos = current.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(current.len());
                 let end_byte = current[byte_pos..].chars().next().map(|ch| byte_pos + ch.len_utf8()).unwrap_or(byte_pos);
@@ -727,20 +654,14 @@ fn split_text_for_tts(text: &str, max_chars: usize) -> Vec<String> {
 fn is_hallucination(text: &str) -> bool {
     let lower = text.to_lowercase();
     let patterns = [
-        "thanks for watching", "thank you for watching",
-        "please subscribe", "subscribe to",
-        "amara.org", "subtitle", "subtitles",
-        "mbc", "kbs", "jtbc",
-        "yoyo television", "mingshi",
+        "thanks for watching", "thank you for watching", "please subscribe", "subscribe to",
+        "amara.org", "subtitle", "subtitles", "mbc", "kbs", "jtbc", "yoyo television", "mingshi",
     ];
     patterns.iter().any(|p| lower.contains(p))
 }
 
 fn detect_language(text: &str) -> &'static str {
-    let mut cjk = 0usize;
-    let mut latin = 0usize;
-    let mut cyrillic = 0usize;
-    let mut arabic = 0usize;
+    let mut cjk = 0usize; let mut latin = 0usize; let mut cyrillic = 0usize; let mut arabic = 0usize;
     for c in text.chars() {
         if c >= '\u{4e00}' && c <= '\u{9fff}' { cjk += 1; }
         else if c.is_ascii_alphabetic() { latin += 1; }
@@ -765,13 +686,11 @@ fn choose_tts_for_language(lang: &str, config: &GroqConfig) -> (String, String) 
 
 fn language_name(code: &str) -> &'static str {
     match code {
-        "zh" => "Chinese (Simplified)",
-        "en" => "English", "ja" => "Japanese", "ko" => "Korean",
-        "fr" => "French", "de" => "German", "es" => "Spanish",
-        "ru" => "Russian", "ar" => "Arabic", "pt" => "Portuguese",
-        "it" => "Italian", "nl" => "Dutch", "pl" => "Polish",
-        "tr" => "Turkish", "hi" => "Hindi", "th" => "Thai",
-        "vi" => "Vietnamese", "id" => "Indonesian",
+        "zh" => "Chinese (Simplified)", "en" => "English", "ja" => "Japanese",
+        "ko" => "Korean", "fr" => "French", "de" => "German", "es" => "Spanish",
+        "ru" => "Russian", "ar" => "Arabic", "pt" => "Portuguese", "it" => "Italian",
+        "nl" => "Dutch", "pl" => "Polish", "tr" => "Turkish", "hi" => "Hindi",
+        "th" => "Thai", "vi" => "Vietnamese", "id" => "Indonesian",
         _ => "the user's language",
     }
 }
@@ -782,24 +701,8 @@ fn build_system_prompt(user_prompt: &str, language: &str, config: &GroqConfig) -
     let llm_list = config.llm_models_available.join(", ");
     let tts_list = config.tts_models_available.join(", ");
     let voice_list = config.tts_voices_available.join(", ");
-
     format!(
-        "{}\n\n\
-        Always reply in {}.\n\
-        Detect the language of the user's latest message and respond in that language, even if it differs from the configured language above.\n\
-        Output plain prose only. Do NOT use markdown, tables, bullet points, headings, emojis, or code blocks, because the reply will be spoken through a text-to-speech engine.\n\
-        Keep the entire reply under 400 characters when possible.\n\n\
-        Available models you can switch to using the switch_model tool:\n\
-        STT models: {}\n\
-        LLM models: {}\n\
-        TTS models: {}\n\
-        TTS voices: {}\n\n\
-        When the user asks to change a model, use the switch_model tool with the appropriate model_type (stt, llm, tts, voice) and model name. Do not just describe the change; actually call the tool.\n\
-        When the user asks to set an alarm, use the set_alarm tool. If the user wants multiple alarms at different times, call set_alarm once per time.\n\
-        When the user asks to control the LED, use the led_control tool.\n\
-        When the user wants to start a conversation mode (no wake word needed), use the conversation_mode tool with enabled=true. To exit, use enabled=false.\n\
-        When the user asks for a new session, use the session_control tool with action=new.\n\
-        When the user asks to mute or unmute the microphone, use the set_mute tool.",
+        "{}\n\nAlways reply in {}.\nDetect the language of the user's latest message and respond in that language, even if it differs from the configured language above.\nOutput plain prose only. Do NOT use markdown, tables, bullet points, headings, emojis, or code blocks, because the reply will be spoken through a text-to-speech engine.\nKeep the entire reply under 400 characters when possible.\n\nAvailable models you can switch to using the switch_model tool:\nSTT models: {}\nLLM models: {}\nTTS models: {}\nTTS voices: {}\n\nWhen the user asks to change a model, use the switch_model tool with the appropriate model_type (stt, llm, tts, voice) and model name. Do not just describe the change; actually call the tool.\nWhen the user asks to set an alarm, use the set_alarm tool. If the user wants multiple alarms at different times, call set_alarm once per time.\nWhen the user asks to control the LED, use the led_control tool.\nWhen the user wants to start a conversation mode (no wake word needed), use the conversation_mode tool with enabled=true. To exit, use enabled=false.\nWhen the user asks for a new session, use the session_control tool with action=new.\nWhen the user asks to mute or unmute the microphone, use the set_mute tool.",
         user_prompt, lang_name, stt_list, llm_list, tts_list, voice_list
     )
 }
@@ -810,16 +713,14 @@ fn build_system_prompt(user_prompt: &str, language: &str, config: &GroqConfig) -
 
 fn adjust_volume_relative(config: &AudioConfig, delta: i32) {
     let output = std::process::Command::new("amixer")
-        .args(["-c", &config.card_index.to_string(), "get", &config.mixer_control])
-        .output();
+        .args(["-c", &config.card_index.to_string(), "get", &config.mixer_control]).output();
     let current = match output {
         Ok(o) => parse_volume(&String::from_utf8_lossy(&o.stdout)).unwrap_or(50),
         Err(_) => return,
     };
     let target = ((current as i32) + delta).clamp(0, config.max_volume as i32);
     let _ = std::process::Command::new("amixer")
-        .args(["-c", &config.card_index.to_string(), "set", &config.mixer_control, &format!("{}%", target)])
-        .output();
+        .args(["-c", &config.card_index.to_string(), "set", &config.mixer_control, &format!("{}%", target)]).output();
     info!("Volume adjusted to {}%", target);
 }
 
@@ -834,15 +735,11 @@ fn start_key_listener(config: KeysConfig, audio: AudioConfig, led: LedHandle, st
         info!("Key listener started on {}", config.device);
         let mut buf = [0u8; 16];
         loop {
-            if file.read_exact(&mut buf).is_err() {
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
-            }
+            if file.read_exact(&mut buf).is_err() { std::thread::sleep(Duration::from_millis(100)); continue; }
             let ev_type = u16::from_le_bytes([buf[8], buf[9]]);
             let ev_code = u16::from_le_bytes([buf[10], buf[11]]);
             let ev_value = i32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
             if ev_type != 1 { continue; }
-
             if ev_code == config.mute && ev_value == 1 {
                 let prev = state.muted.load(Ordering::SeqCst);
                 let now = !prev;
@@ -850,11 +747,9 @@ fn start_key_listener(config: KeysConfig, audio: AudioConfig, led: LedHandle, st
                 info!("Mute toggled: mic {}", if now { "OFF" } else { "ON" });
                 led.send(LedCommand::SetState(if now { LedState::Muted } else { LedState::Idle }));
             } else if ev_value == 1 {
-                if ev_code == config.volume_up {
-                    adjust_volume_relative(&audio, config.volume_step as i32);
-                } else if ev_code == config.volume_down {
-                    adjust_volume_relative(&audio, -(config.volume_step as i32));
-                } else if ev_code == config.play_pause {
+                if ev_code == config.volume_up { adjust_volume_relative(&audio, config.volume_step as i32); }
+                else if ev_code == config.volume_down { adjust_volume_relative(&audio, -(config.volume_step as i32)); }
+                else if ev_code == config.play_pause {
                     info!("Play/pause button pressed, stopping playback");
                     state.stop_playback.store(true, Ordering::SeqCst);
                 }
@@ -883,8 +778,7 @@ fn check_audio_devices(config: &AudioConfig) -> Vec<(&'static str, DiagnosticRes
     match host.default_input_device() {
         Some(dev) => match dev.name() {
             Ok(name) => match dev.default_input_config() {
-                Ok(cfg) => results.push(("Input device", DiagnosticResult::Ok(format!(
-                    "'{}' ({} Hz, {} ch)", name, cfg.sample_rate().0, cfg.channels())))),
+                Ok(cfg) => results.push(("Input device", DiagnosticResult::Ok(format!("'{}' ({} Hz, {} ch)", name, cfg.sample_rate().0, cfg.channels())))),
                 Err(e) => results.push(("Input device", DiagnosticResult::Warn(format!("'{}' query failed: {}", name, e)))),
             },
             Err(e) => results.push(("Input device", DiagnosticResult::Warn(format!("name unknown: {}", e)))),
@@ -896,16 +790,12 @@ fn check_audio_devices(config: &AudioConfig) -> Vec<(&'static str, DiagnosticRes
         _ => results.push(("aplay", DiagnosticResult::Fail("aplay not found".into()))),
     }
     match std::process::Command::new("amixer")
-        .args(["-c", &config.card_index.to_string(), "get", &config.mixer_control])
-        .output()
-    {
+        .args(["-c", &config.card_index.to_string(), "get", &config.mixer_control]).output() {
         Ok(out) if out.status.success() => {
             let vol = parse_volume(&String::from_utf8_lossy(&out.stdout)).unwrap_or(0);
-            results.push(("Mixer control", DiagnosticResult::Ok(format!(
-                "'{}' card {} = {}%", config.mixer_control, config.card_index, vol))));
+            results.push(("Mixer control", DiagnosticResult::Ok(format!("'{}' card {} = {}%", config.mixer_control, config.card_index, vol))));
         }
-        Ok(out) => results.push(("Mixer control", DiagnosticResult::Warn(format!(
-            "amixer: {}", String::from_utf8_lossy(&out.stderr).trim())))),
+        Ok(out) => results.push(("Mixer control", DiagnosticResult::Warn(format!("amixer: {}", String::from_utf8_lossy(&out.stderr).trim())))),
         Err(e) => results.push(("Mixer control", DiagnosticResult::Fail(format!("amixer not runnable: {}", e)))),
     }
     results
@@ -919,9 +809,7 @@ fn check_input_device(config: &KeysConfig) -> DiagnosticResult {
 
 fn check_led(config: &LedConfig) -> DiagnosticResult {
     if !config.enabled { return DiagnosticResult::Warn("disabled in config".into()); }
-    if !PathBuf::from(&config.device).exists() {
-        return DiagnosticResult::Fail(format!("{} not found", config.device));
-    }
+    if !PathBuf::from(&config.device).exists() { return DiagnosticResult::Fail(format!("{} not found", config.device)); }
     let test = [0u32; LED_COUNT];
     match write_leds(&config.device, &test) {
         Ok(_) => DiagnosticResult::Ok(format!("{} writable", config.device)),
@@ -934,21 +822,12 @@ async fn check_region(client: &reqwest::Client) -> Vec<DiagnosticResult> {
     match client.get(IP_API_URL).send().await {
         Ok(resp) if resp.status().is_success() => match resp.json::<IpApiResponse>().await {
             Ok(info) => {
-                let loc = format!("{}, {} ({})",
-                                  info.city.as_deref().unwrap_or("?"),
-                                  info.region_name.as_deref().unwrap_or("?"),
-                                  info.country.as_deref().unwrap_or("?"));
-                results.push(DiagnosticResult::Ok(format!("IP {} - {}",
-                                                          info.query.as_deref().unwrap_or("?"), loc)));
-                if let Some(tz) = &info.timezone {
-                    results.push(DiagnosticResult::Ok(format!("timezone {}", tz)));
-                }
+                let loc = format!("{}, {} ({})", info.city.as_deref().unwrap_or("?"), info.region_name.as_deref().unwrap_or("?"), info.country.as_deref().unwrap_or("?"));
+                results.push(DiagnosticResult::Ok(format!("IP {} - {}", info.query.as_deref().unwrap_or("?"), loc)));
+                if let Some(tz) = &info.timezone { results.push(DiagnosticResult::Ok(format!("timezone {}", tz))); }
                 let code = info.country_code.as_deref().unwrap_or("");
-                if code == "CN" || code == "HK" {
-                    results.push(DiagnosticResult::Warn("Region may be blocked by Groq API".into()));
-                } else {
-                    results.push(DiagnosticResult::Ok("Region appears allowed for Groq API".into()));
-                }
+                if code == "CN" || code == "HK" { results.push(DiagnosticResult::Warn("Region may be blocked by Groq API".into())); }
+                else { results.push(DiagnosticResult::Ok("Region appears allowed for Groq API".into())); }
             }
             Err(e) => results.push(DiagnosticResult::Warn(format!("parse error: {}", e))),
         },
@@ -969,24 +848,16 @@ async fn check_groq_api(client: &reqwest::Client, config: &GroqConfig) -> Vec<Di
             let status = r.status().as_u16();
             if status != 200 {
                 let body = r.text().await.unwrap_or_default();
-                results.push(DiagnosticResult::Fail(format!("API key rejected (HTTP {}): {}",
-                                                            status, body.chars().take(120).collect::<String>())));
+                results.push(DiagnosticResult::Fail(format!("API key rejected (HTTP {}): {}", status, body.chars().take(120).collect::<String>())));
                 return results;
             }
             results.push(DiagnosticResult::Ok("API key accepted".into()));
             match r.json::<ModelsResponse>().await {
                 Ok(models) => {
                     let ids: Vec<String> = models.data.iter().map(|m| m.id.clone()).collect();
-                    for (label, id) in [
-                        ("STT model", &config.stt_model),
-                        ("LLM model", &config.llm_model),
-                        ("TTS model", &config.tts_model),
-                    ] {
-                        if ids.iter().any(|i| i == id) {
-                            results.push(DiagnosticResult::Ok(format!("{} available", label)));
-                        } else {
-                            results.push(DiagnosticResult::Warn(format!("{} '{}' not in account", label, id)));
-                        }
+                    for (label, id) in [("STT model", &config.stt_model), ("LLM model", &config.llm_model), ("TTS model", &config.tts_model)] {
+                        if ids.iter().any(|i| i == id) { results.push(DiagnosticResult::Ok(format!("{} available", label))); }
+                        else { results.push(DiagnosticResult::Warn(format!("{} '{}' not in account", label, id))); }
                     }
                 }
                 Err(e) => results.push(DiagnosticResult::Warn(format!("cannot parse models: {}", e))),
@@ -998,11 +869,7 @@ async fn check_groq_api(client: &reqwest::Client, config: &GroqConfig) -> Vec<Di
 }
 
 fn count_result(r: &DiagnosticResult, fails: &mut usize, warns: &mut usize) {
-    match r {
-        DiagnosticResult::Fail(_) => *fails += 1,
-        DiagnosticResult::Warn(_) => *warns += 1,
-        DiagnosticResult::Ok(_) => {}
-    }
+    match r { DiagnosticResult::Fail(_) => *fails += 1, DiagnosticResult::Warn(_) => *warns += 1, DiagnosticResult::Ok(_) => {} }
 }
 
 async fn run_diagnostics(config: &Config, client: &reqwest::Client) -> bool {
@@ -1010,12 +877,9 @@ async fn run_diagnostics(config: &Config, client: &reqwest::Client) -> bool {
     println!("============================================================");
     println!("  Rimth Device Diagnostics");
     println!("============================================================");
+    let mut fails = 0usize; let mut warns = 0usize;
 
-    let mut fails = 0usize;
-    let mut warns = 0usize;
-
-    println!();
-    println!("[System]");
+    println!(); println!("[System]");
     let system_items: Vec<(&str, DiagnosticResult)> = vec![
         ("Config file", match config_path() {
             Ok(p) if p.exists() => DiagnosticResult::Ok(format!("{}", p.display())),
@@ -1034,24 +898,20 @@ async fn run_diagnostics(config: &Config, client: &reqwest::Client) -> bool {
     ];
     for (label, r) in &system_items { r.print(label); count_result(r, &mut fails, &mut warns); }
 
-    println!();
-    println!("[Audio]");
+    println!(); println!("[Audio]");
     for (label, r) in check_audio_devices(&config.audio) { r.print(label); count_result(&r, &mut fails, &mut warns); }
 
-    println!();
-    println!("[Input]");
+    println!(); println!("[Input]");
     let input_r = check_input_device(&config.keys);
     input_r.print("Input device");
     count_result(&input_r, &mut fails, &mut warns);
 
-    println!();
-    println!("[LED]");
+    println!(); println!("[LED]");
     let led_r = check_led(&config.led);
     led_r.print("LED device");
     count_result(&led_r, &mut fails, &mut warns);
 
-    println!();
-    println!("[Network]");
+    println!(); println!("[Network]");
     if config.proxy.url.is_empty() {
         let r = DiagnosticResult::Warn("proxy not configured".into());
         r.print("Proxy"); count_result(&r, &mut fails, &mut warns);
@@ -1061,8 +921,7 @@ async fn run_diagnostics(config: &Config, client: &reqwest::Client) -> bool {
     }
     for r in check_region(client).await { r.print("Region"); count_result(&r, &mut fails, &mut warns); }
 
-    println!();
-    println!("[Groq API]");
+    println!(); println!("[Groq API]");
     for r in check_groq_api(client, &config.groq).await { r.print("Groq"); count_result(&r, &mut fails, &mut warns); }
 
     println!();
@@ -1074,7 +933,7 @@ async fn run_diagnostics(config: &Config, client: &reqwest::Client) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Audio capture
+// Audio capture / playback
 // ---------------------------------------------------------------------------
 
 fn start_capture(tx: Sender<Vec<f32>>, sample_rate: u32, mic_gain: Arc<AtomicU32>) -> Result<Stream> {
@@ -1112,12 +971,7 @@ fn start_capture(tx: Sender<Vec<f32>>, sample_rate: u32, mic_gain: Arc<AtomicU32
     Ok(stream)
 }
 
-async fn wait_trigger(
-    rx: &mut Receiver<Vec<f32>>,
-    config: &AudioConfig,
-    is_playing: &Arc<AtomicBool>,
-    key_state: &KeyState,
-) -> bool {
+async fn wait_trigger(rx: &mut Receiver<Vec<f32>>, config: &AudioConfig, is_playing: &Arc<AtomicBool>, key_state: &KeyState) -> bool {
     while let Some(chunk) = rx.recv().await {
         if is_playing.load(Ordering::Relaxed) { continue; }
         if key_state.muted.load(Ordering::Relaxed) { continue; }
@@ -1130,12 +984,7 @@ async fn wait_trigger(
     false
 }
 
-async fn record(
-    rx: &mut Receiver<Vec<f32>>,
-    config: &AudioConfig,
-    is_playing: &Arc<AtomicBool>,
-    key_state: &KeyState,
-) -> Result<Option<Vec<u8>>> {
+async fn record(rx: &mut Receiver<Vec<f32>>, config: &AudioConfig, is_playing: &Arc<AtomicBool>, key_state: &KeyState) -> Result<Option<Vec<u8>>> {
     let mut samples: Vec<f32> = Vec::new();
     let mut silence: usize = 0;
     let silence_limit = config.sample_rate as usize * config.silence_duration_ms as usize / 1000;
@@ -1155,44 +1004,36 @@ async fn record(
         if samples.len() > max_samples { break; }
     }
 
-    let spec = WavSpec {
-        channels: 1, sample_rate: config.sample_rate,
-        bits_per_sample: 16, sample_format: HoundSampleFormat::Int,
-    };
+    let spec = WavSpec { channels: 1, sample_rate: config.sample_rate, bits_per_sample: 16, sample_format: HoundSampleFormat::Int };
     let mut cursor = Cursor::new(Vec::new());
     {
         let mut w = WavWriter::new(&mut cursor, spec)?;
-        for &s in &samples {
-            w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)?;
-        }
+        for &s in &samples { w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)?; }
         w.finalize()?;
     }
     Ok(Some(cursor.into_inner()))
 }
 
-// ---------------------------------------------------------------------------
-// Playback
-// ---------------------------------------------------------------------------
-
 fn play_audio_bytes(bytes: Vec<u8>, stop_flag: &Arc<AtomicBool>) -> Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    if stop_flag.load(Ordering::SeqCst) {
-        stop_flag.store(false, Ordering::SeqCst);
-        return Ok(());
-    }
+    if stop_flag.load(Ordering::SeqCst) { stop_flag.store(false, Ordering::SeqCst); return Ok(()); }
 
     let mut child = Command::new("aplay")
-        .arg("-q").arg("-")
+        .arg("-q")
+        .arg("--period-size=1024")
+        .arg("--buffer-size=4096")
+        .arg("-")
         .stdin(Stdio::piped())
-        .stdout(Stdio::null()).stderr(Stdio::null())
-        .spawn().context("Failed to spawn aplay")?;
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("Failed to spawn aplay")?;
 
     let mut stdin = child.stdin.take().context("Failed to open aplay stdin")?;
     if let Err(e) = stdin.write_all(&bytes) {
-        let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.kill(); let _ = child.wait();
         return Err(anyhow::Error::from(e).context("Failed to write to aplay stdin"));
     }
     drop(stdin);
@@ -1202,33 +1043,27 @@ fn play_audio_bytes(bytes: Vec<u8>, stop_flag: &Arc<AtomicBool>) -> Result<()> {
             Ok(Some(_)) => break,
             Ok(None) => {
                 if stop_flag.load(Ordering::SeqCst) {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    let _ = child.kill(); let _ = child.wait();
                     stop_flag.store(false, Ordering::SeqCst);
                     info!("Playback stopped by key");
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(30));
+                std::thread::sleep(Duration::from_millis(20));
             }
-            Err(e) => {
-                let _ = child.kill();
-                return Err(anyhow::Error::from(e).context("aplay wait failed"));
-            }
+            Err(e) => { let _ = child.kill(); return Err(anyhow::Error::from(e).context("aplay wait failed")); }
         }
     }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Prompt sounds
+// Prompts
 // ---------------------------------------------------------------------------
 
 fn prompt_path(p: Prompt) -> PathBuf {
     let name = match p {
-        Prompt::Auth => "auth_error.wav",
-        Prompt::RateLimit => "rate_limited.wav",
-        Prompt::BadRequest => "bad_request.wav",
-        Prompt::Server => "server_error.wav",
+        Prompt::Auth => "auth_error.wav", Prompt::RateLimit => "rate_limited.wav",
+        Prompt::BadRequest => "bad_request.wav", Prompt::Server => "server_error.wav",
         Prompt::Network => "network_error.wav",
     };
     sounds_dir().map(|d| d.join(name)).unwrap_or_else(|_| PathBuf::from(name))
@@ -1262,13 +1097,8 @@ async fn play_prompt(p: Prompt, stop_flag: &Arc<AtomicBool>) {
     if !path.exists() { warn!("Missing prompt sound: {}", path.display()); return; }
     let stop = stop_flag.clone();
     let _ = tokio::task::spawn_blocking(move || {
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => { warn!("Read prompt failed: {}", e); return; }
-        };
-        if let Err(e) = play_audio_bytes(bytes, &stop) {
-            warn!("Play prompt failed: {}", e);
-        }
+        let bytes = match std::fs::read(&path) { Ok(b) => b, Err(e) => { warn!("Read prompt failed: {}", e); return; } };
+        if let Err(e) = play_audio_bytes(bytes, &stop) { warn!("Play prompt failed: {}", e); }
     }).await;
 }
 
@@ -1277,9 +1107,7 @@ async fn play_prompt(p: Prompt, stop_flag: &Arc<AtomicBool>) {
 // ---------------------------------------------------------------------------
 
 async fn stt(client: &reqwest::Client, config: &GroqConfig, wav: Vec<u8>) -> Result<String, SttError> {
-    let part = multipart::Part::bytes(wav)
-        .file_name("audio.wav")
-        .mime_str("audio/wav")
+    let part = multipart::Part::bytes(wav).file_name("audio.wav").mime_str("audio/wav")
         .map_err(|e| SttError { status: 0, message: e.to_string() })?;
     let form = multipart::Form::new()
         .part("file", part)
@@ -1290,8 +1118,7 @@ async fn stt(client: &reqwest::Client, config: &GroqConfig, wav: Vec<u8>) -> Res
         .map_err(|e| SttError { status: 0, message: e.to_string() })?;
     let status = resp.status().as_u16();
     if status == 200 {
-        let body: SttResponse = resp.json().await
-            .map_err(|e| SttError { status, message: e.to_string() })?;
+        let body: SttResponse = resp.json().await.map_err(|e| SttError { status, message: e.to_string() })?;
         Ok(body.text)
     } else {
         let msg = resp.text().await.unwrap_or_default();
@@ -1316,12 +1143,7 @@ async fn tts(client: &reqwest::Client, config: &GroqConfig, text: &str, voice: &
     Ok(resp.bytes().await?.to_vec())
 }
 
-async fn chat(
-    client: &reqwest::Client,
-    config: &GroqConfig,
-    messages: &[ChatMessage],
-    tools: Option<serde_json::Value>,
-) -> Result<ChatMessageResponse> {
+async fn chat(client: &reqwest::Client, config: &GroqConfig, messages: &[ChatMessage], tools: Option<serde_json::Value>) -> Result<ChatMessageResponse> {
     let mut body = serde_json::json!({
         "model": config.llm_model,
         "messages": messages,
@@ -1336,8 +1158,7 @@ async fn chat(
         anyhow::bail!("Chat {}: {}", status, msg);
     }
     let body: ChatResponse = resp.json().await?;
-    body.choices.into_iter().next().map(|c| c.message)
-        .ok_or_else(|| anyhow::anyhow!("No choices"))
+    body.choices.into_iter().next().map(|c| c.message).ok_or_else(|| anyhow::anyhow!("No choices"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1365,17 +1186,15 @@ fn tools_definition() -> serde_json::Value {
             "description": "Run device diagnostics.",
             "parameters": {"type": "object", "properties": {}, "required": []}}},
         {"type": "function", "function": {"name": "switch_model",
-            "description": "Switch the STT, LLM, TTS model or TTS voice. Use when the user asks to change model.",
+            "description": "Switch the STT, LLM, TTS model or TTS voice.",
             "parameters": {"type": "object", "properties": {
                 "model_type": {"type": "string", "enum": ["stt", "llm", "tts", "voice"]},
-                "model_name": {"type": "string"}
-            }, "required": ["model_type", "model_name"]}}},
+                "model_name": {"type": "string"}}, "required": ["model_type", "model_name"]}}},
         {"type": "function", "function": {"name": "set_alarm",
             "description": "Set an alarm on the speaker.",
             "parameters": {"type": "object", "properties": {
                 "time": {"type": "string"}, "label": {"type": "string"},
-                "repeat": {"type": "string", "enum": ["once", "daily", "weekdays"]}
-            }, "required": ["time"]}}},
+                "repeat": {"type": "string", "enum": ["once", "daily", "weekdays"]}}, "required": ["time"]}}},
         {"type": "function", "function": {"name": "list_alarms",
             "description": "List all set alarms.",
             "parameters": {"type": "object", "properties": {}, "required": []}}},
@@ -1385,11 +1204,9 @@ fn tools_definition() -> serde_json::Value {
         {"type": "function", "function": {"name": "led_control",
             "description": "Control the RGB LED ring on the speaker.",
             "parameters": {"type": "object", "properties": {
-                "color": {"type": "string"},
-                "index": {"type": "integer"},
+                "color": {"type": "string"}, "index": {"type": "integer"},
                 "brightness": {"type": "integer"},
-                "state": {"type": "string", "enum": ["idle", "listening", "speaking", "muted", "off"]}
-            }}}},
+                "state": {"type": "string", "enum": ["idle", "listening", "speaking", "muted", "off"]}}}}},
         {"type": "function", "function": {"name": "conversation_mode",
             "description": "Enable or disable conversation mode.",
             "parameters": {"type": "object", "properties": {"enabled": {"type": "boolean"}}, "required": ["enabled"]}}},
@@ -1397,8 +1214,7 @@ fn tools_definition() -> serde_json::Value {
             "description": "Manage sessions.",
             "parameters": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["new", "list", "switch"]},
-                "session_name": {"type": "string"}
-            }, "required": ["action"]}}},
+                "session_name": {"type": "string"}}, "required": ["action"]}}},
         {"type": "function", "function": {"name": "set_mic_gain",
             "description": "Set the microphone gain multiplier (0.1 - 10.0).",
             "parameters": {"type": "object", "properties": {"gain": {"type": "number"}}, "required": ["gain"]}}},
@@ -1413,64 +1229,39 @@ fn tools_definition() -> serde_json::Value {
 
 async fn amixer_get(config: &AudioConfig) -> Result<u32> {
     let output = tokio::process::Command::new("amixer")
-        .args(["-c", &config.card_index.to_string(), "get", &config.mixer_control])
-        .output().await?;
-    parse_volume(&String::from_utf8_lossy(&output.stdout))
-        .ok_or_else(|| anyhow::anyhow!("Cannot parse volume"))
+        .args(["-c", &config.card_index.to_string(), "get", &config.mixer_control]).output().await?;
+    parse_volume(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| anyhow::anyhow!("Cannot parse volume"))
 }
 
 async fn amixer_set(config: &AudioConfig, percent: u32) -> Result<u32> {
     let clamped = percent.min(config.max_volume);
     let output = tokio::process::Command::new("amixer")
-        .args(["-c", &config.card_index.to_string(), "set", &config.mixer_control, &format!("{}%", clamped)])
-        .output().await?;
+        .args(["-c", &config.card_index.to_string(), "set", &config.mixer_control, &format!("{}%", clamped)]).output().await?;
     if !output.status.success() { anyhow::bail!("amixer failed"); }
     Ok(clamped)
 }
 
-async fn execute_tool(
-    client: &reqwest::Client,
-    audio_config: &AudioConfig,
-    alarm_config: &AlarmConfig,
-    state: &Arc<AppState>,
-    name: &str,
-    args: &str,
-) -> String {
+async fn execute_tool(client: &reqwest::Client, audio_config: &AudioConfig, alarm_config: &AlarmConfig, state: &Arc<AppState>, name: &str, args: &str) -> String {
     match name {
         "set_volume" => {
-            let parsed: serde_json::Value = match serde_json::from_str(args) {
-                Ok(v) => v, Err(e) => return format!("Parse failed: {}", e),
-            };
+            let parsed: serde_json::Value = match serde_json::from_str(args) { Ok(v) => v, Err(e) => return format!("Parse failed: {}", e) };
             let percent = parsed["percent"].as_u64().unwrap_or(50) as u32;
-            match amixer_set(audio_config, percent).await {
-                Ok(actual) => format!("Volume set to {}%", actual),
-                Err(e) => format!("Failed: {}", e),
-            }
+            match amixer_set(audio_config, percent).await { Ok(a) => format!("Volume set to {}%", a), Err(e) => format!("Failed: {}", e) }
         }
-        "get_volume" => match amixer_get(audio_config).await {
-            Ok(v) => format!("Current volume is {}%", v),
-            Err(e) => format!("Failed: {}", e),
-        },
+        "get_volume" => match amixer_get(audio_config).await { Ok(v) => format!("Current volume is {}%", v), Err(e) => format!("Failed: {}", e) },
         "adjust_volume" => {
-            let parsed: serde_json::Value = match serde_json::from_str(args) {
-                Ok(v) => v, Err(e) => return format!("Parse failed: {}", e),
-            };
+            let parsed: serde_json::Value = match serde_json::from_str(args) { Ok(v) => v, Err(e) => return format!("Parse failed: {}", e) };
             let delta = parsed["delta"].as_i64().unwrap_or(0);
             match amixer_get(audio_config).await {
                 Ok(current) => {
                     let target = (current as i64 + delta).clamp(0, audio_config.max_volume as i64);
-                    match amixer_set(audio_config, target as u32).await {
-                        Ok(actual) => format!("Volume adjusted to {}%", actual),
-                        Err(e) => format!("Failed: {}", e),
-                    }
+                    match amixer_set(audio_config, target as u32).await { Ok(a) => format!("Volume adjusted to {}%", a), Err(e) => format!("Failed: {}", e) }
                 }
                 Err(e) => format!("Failed: {}", e),
             }
         }
         "run_terminal" => {
-            let parsed: serde_json::Value = match serde_json::from_str(args) {
-                Ok(v) => v, Err(e) => return format!("Parse failed: {}", e),
-            };
+            let parsed: serde_json::Value = match serde_json::from_str(args) { Ok(v) => v, Err(e) => return format!("Parse failed: {}", e) };
             let command = parsed["command"].as_str().unwrap_or("");
             if command.is_empty() { return "No command".into(); }
             info!("Running: {}", command);
@@ -1480,10 +1271,7 @@ async fn execute_tool(
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     let mut result = String::new();
                     if !stdout.is_empty() { result.push_str(&stdout); }
-                    if !stderr.is_empty() {
-                        if !result.is_empty() { result.push('\n'); }
-                        result.push_str("STDERR: "); result.push_str(&stderr);
-                    }
+                    if !stderr.is_empty() { if !result.is_empty() { result.push('\n'); } result.push_str("STDERR: "); result.push_str(&stderr); }
                     if result.len() > 2000 { result.truncate(2000); result.push_str("... (truncated)"); }
                     result
                 }
@@ -1491,9 +1279,7 @@ async fn execute_tool(
             }
         }
         "fetch_url" => {
-            let parsed: serde_json::Value = match serde_json::from_str(args) {
-                Ok(v) => v, Err(e) => return format!("Parse failed: {}", e),
-            };
+            let parsed: serde_json::Value = match serde_json::from_str(args) { Ok(v) => v, Err(e) => return format!("Parse failed: {}", e) };
             let url = parsed["url"].as_str().unwrap_or("");
             if url.is_empty() { return "No URL".into(); }
             info!("Fetching: {}", url);
@@ -1511,13 +1297,10 @@ async fn execute_tool(
         }
         "run_diagnostics" => "Diagnostics requested, see console output".into(),
         "switch_model" => {
-            let parsed: serde_json::Value = match serde_json::from_str(args) {
-                Ok(v) => v, Err(e) => return format!("Parse failed: {}", e),
-            };
+            let parsed: serde_json::Value = match serde_json::from_str(args) { Ok(v) => v, Err(e) => return format!("Parse failed: {}", e) };
             let model_type = parsed["model_type"].as_str().unwrap_or("");
             let model_name = parsed["model_name"].as_str().unwrap_or("");
             if model_name.is_empty() { return "No model name".into(); }
-
             let mut cfg = state.groq.write().await;
             match model_type {
                 "stt" => { cfg.stt_model = model_name.into(); }
@@ -1530,9 +1313,7 @@ async fn execute_tool(
             format!("Switched {} to {}", model_type, model_name)
         }
         "set_alarm" => {
-            let parsed: serde_json::Value = match serde_json::from_str(args) {
-                Ok(v) => v, Err(e) => return format!("Parse failed: {}", e),
-            };
+            let parsed: serde_json::Value = match serde_json::from_str(args) { Ok(v) => v, Err(e) => return format!("Parse failed: {}", e) };
             let time = parsed["time"].as_str().unwrap_or("07:00");
             let label = parsed["label"].as_str().unwrap_or("Alarm");
             let repeat = parsed["repeat"].as_str().unwrap_or("once");
@@ -1540,30 +1321,21 @@ async fn execute_tool(
         }
         "list_alarms" => list_alarms_text(&alarm_config.store_path),
         "delete_alarm" => {
-            let parsed: serde_json::Value = match serde_json::from_str(args) {
-                Ok(v) => v, Err(e) => return format!("Parse failed: {}", e),
-            };
+            let parsed: serde_json::Value = match serde_json::from_str(args) { Ok(v) => v, Err(e) => return format!("Parse failed: {}", e) };
             let id = parsed["id"].as_str().unwrap_or("");
             delete_alarm(&alarm_config.store_path, id)
         }
         "led_control" => {
-            let parsed: serde_json::Value = match serde_json::from_str(args) {
-                Ok(v) => v, Err(e) => return format!("Parse failed: {}", e),
-            };
+            let parsed: serde_json::Value = match serde_json::from_str(args) { Ok(v) => v, Err(e) => return format!("Parse failed: {}", e) };
             let mut actions: Vec<String> = Vec::new();
             if let Some(state_str) = parsed["state"].as_str() {
                 let led_state = match state_str {
-                    "idle" => Some(LedState::Idle),
-                    "listening" => Some(LedState::Listening),
-                    "speaking" => Some(LedState::Speaking),
-                    "muted" => Some(LedState::Muted),
+                    "idle" => Some(LedState::Idle), "listening" => Some(LedState::Listening),
+                    "speaking" => Some(LedState::Speaking), "muted" => Some(LedState::Muted),
                     "off" => { state.led.send(LedCommand::Off); actions.push("LED off".into()); None }
                     _ => None,
                 };
-                if let Some(s) = led_state {
-                    state.led.send(LedCommand::SetState(s));
-                    actions.push(format!("state {}", state_str));
-                }
+                if let Some(s) = led_state { state.led.send(LedCommand::SetState(s)); actions.push(format!("state {}", state_str)); }
             }
             if let Some(color) = parsed["color"].as_str() {
                 if parse_rgb_hex_to_bgr(color).is_some() {
@@ -1586,42 +1358,32 @@ async fn execute_tool(
                 state.led.send(LedCommand::SetBrightness(b));
                 actions.push(format!("brightness {}", b));
             }
-            if actions.is_empty() { "No LED action specified".into() }
-            else { format!("LED: {}", actions.join(", ")) }
+            if actions.is_empty() { "No LED action specified".into() } else { format!("LED: {}", actions.join(", ")) }
         }
         "conversation_mode" => {
-            let parsed: serde_json::Value = match serde_json::from_str(args) {
-                Ok(v) => v, Err(e) => return format!("Parse failed: {}", e),
-            };
+            let parsed: serde_json::Value = match serde_json::from_str(args) { Ok(v) => v, Err(e) => return format!("Parse failed: {}", e) };
             let enabled = parsed["enabled"].as_bool().unwrap_or(false);
             state.key_state.conversation_mode.store(enabled, Ordering::SeqCst);
-            if enabled { "Conversation mode enabled. I will keep listening.".into() }
-            else { "Conversation mode disabled.".into() }
+            if enabled { "Conversation mode enabled. I will keep listening.".into() } else { "Conversation mode disabled.".into() }
         }
         "session_control" => {
-            let parsed: serde_json::Value = match serde_json::from_str(args) {
-                Ok(v) => v, Err(e) => return format!("Parse failed: {}", e),
-            };
+            let parsed: serde_json::Value = match serde_json::from_str(args) { Ok(v) => v, Err(e) => return format!("Parse failed: {}", e) };
             let action = parsed["action"].as_str().unwrap_or("list");
             match action {
                 "new" => format!("New session created: session_{}", rand::random::<u16>()),
                 "list" => {
                     let sessions = list_sessions(&state.sessions_dir);
-                    if sessions.is_empty() { "No sessions".into() }
-                    else { format!("Sessions: {}", sessions.join(", ")) }
+                    if sessions.is_empty() { "No sessions".into() } else { format!("Sessions: {}", sessions.join(", ")) }
                 }
                 "switch" => {
                     let name = parsed["session_name"].as_str().unwrap_or("");
-                    if name.is_empty() { "No session name provided".into() }
-                    else { format!("Switched to session: {}", name) }
+                    if name.is_empty() { "No session name provided".into() } else { format!("Switched to session: {}", name) }
                 }
                 _ => "Unknown session action".into(),
             }
         }
         "set_mic_gain" => {
-            let parsed: serde_json::Value = match serde_json::from_str(args) {
-                Ok(v) => v, Err(e) => return format!("Parse failed: {}", e),
-            };
+            let parsed: serde_json::Value = match serde_json::from_str(args) { Ok(v) => v, Err(e) => return format!("Parse failed: {}", e) };
             let gain = parsed["gain"].as_f64().unwrap_or(1.0);
             let clamped = (gain as f32).clamp(0.1, 10.0);
             state.mic_gain.store(clamped.to_bits(), Ordering::SeqCst);
@@ -1632,59 +1394,35 @@ async fn execute_tool(
             format!("Microphone gain is {:.1}", gain)
         }
         "set_mute" => {
-            let parsed: serde_json::Value = match serde_json::from_str(args) {
-                Ok(v) => v, Err(e) => return format!("Parse failed: {}", e),
-            };
+            let parsed: serde_json::Value = match serde_json::from_str(args) { Ok(v) => v, Err(e) => return format!("Parse failed: {}", e) };
             let muted = parsed["muted"].as_bool().unwrap_or(false);
             state.key_state.muted.store(muted, Ordering::SeqCst);
-            if muted {
-                state.led.send(LedCommand::SetState(LedState::Muted));
-                "Microphone muted".into()
-            } else {
-                state.led.send(LedCommand::SetState(LedState::Idle));
-                "Microphone unmuted".into()
-            }
+            if muted { state.led.send(LedCommand::SetState(LedState::Muted)); "Microphone muted".into() }
+            else { state.led.send(LedCommand::SetState(LedState::Idle)); "Microphone unmuted".into() }
         }
         _ => format!("Unknown tool: {}", name),
     }
 }
 
 // ---------------------------------------------------------------------------
-// Session helpers
+// Sessions
 // ---------------------------------------------------------------------------
 
-fn session_file_path(dir: &PathBuf, name: &str) -> PathBuf {
-    dir.join(format!("{}.json", name))
-}
+fn session_file_path(dir: &PathBuf, name: &str) -> PathBuf { dir.join(format!("{}.json", name)) }
 
-/// Remove historical tool-call/tool-result messages that could violate
-/// Groq's Harmony encoding rules (missing `name`, orphaned tool_call_id, etc.).
-/// Keeps only system, user, and text-only assistant messages.
 fn sanitize_session(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let mut out: Vec<ChatMessage> = Vec::new();
     for msg in messages {
         match msg.role.as_str() {
-            "system" => {
-                if msg.content.is_some() {
-                    out.push(ChatMessage::system(msg.content.unwrap_or_default()));
-                }
-            }
-            "user" => {
-                if msg.content.is_some() {
-                    out.push(ChatMessage::user(msg.content.unwrap_or_default()));
-                }
-            }
+            "system" => { if let Some(c) = msg.content { out.push(ChatMessage::system(c)); } }
+            "user" => { if let Some(c) = msg.content { out.push(ChatMessage::user(c)); } }
             "assistant" => {
-                // Only keep assistant messages that have text and no tool calls.
                 if msg.tool_calls.is_none() {
                     if let Some(c) = msg.content {
-                        if !c.trim().is_empty() {
-                            out.push(ChatMessage::assistant(Some(c), None));
-                        }
+                        if !c.trim().is_empty() { out.push(ChatMessage::assistant(Some(c), None)); }
                     }
                 }
             }
-            // Drop all tool result messages.
             _ => {}
         }
     }
@@ -1707,9 +1445,7 @@ fn load_session(dir: &PathBuf, name: &str) -> Vec<ChatMessage> {
 
 fn save_session(dir: &PathBuf, name: &str, messages: &[ChatMessage]) {
     let path = session_file_path(dir, name);
-    if let Ok(content) = serde_json::to_string_pretty(messages) {
-        let _ = std::fs::write(&path, content);
-    }
+    if let Ok(content) = serde_json::to_string_pretty(messages) { let _ = std::fs::write(&path, content); }
 }
 
 fn list_sessions(dir: &PathBuf) -> Vec<String> {
@@ -1717,9 +1453,7 @@ fn list_sessions(dir: &PathBuf) -> Vec<String> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".json") {
-                    names.push(name.trim_end_matches(".json").to_string());
-                }
+                if name.ends_with(".json") { names.push(name.trim_end_matches(".json").to_string()); }
             }
         }
     }
@@ -1739,6 +1473,7 @@ async fn speak(
     stop_playback: &Arc<AtomicBool>,
     rx: &mut Receiver<Vec<f32>>,
     led: &LedHandle,
+    capture: &CaptureCtx,
 ) {
     let cleaned = strip_markdown(text);
     if cleaned.trim().is_empty() {
@@ -1763,11 +1498,7 @@ async fn speak(
             info!("Playback cancelled before segment {}", i + 1);
             break;
         }
-        // Clone config for each call so shared lock is not held across await.
-        let cfg_snapshot = {
-            let g = config.clone();
-            g
-        };
+        let cfg_snapshot = config.clone();
         match tts(client, &cfg_snapshot, seg, &tts_voice).await {
             Ok(audio) => {
                 let stop = stop_playback.clone();
@@ -1784,9 +1515,22 @@ async fn speak(
         }
     }
 
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    is_playing.store(false, Ordering::SeqCst);
+    // Drain any audio captured while we were playing. is_playing is still
+    // true here so the main loop drops chunks anyway; we just clear them.
     while rx.try_recv().is_ok() {}
+
+    // Restart the input stream to unblock ALSA. aplay's exclusive access
+    // suspends the cpal input side, and dropping/recreating the stream
+    // forces ALSA to fully release the output device and reopen capture.
+    if let Err(e) = capture.restart() {
+        warn!("Capture restart failed: {}", e);
+    }
+
+    // Drain again to remove any stale data from before the restart.
+    while rx.try_recv().is_ok() {}
+
+    is_playing.store(false, Ordering::SeqCst);
+
     led.send(LedCommand::SetState(LedState::Idle));
 }
 
@@ -1805,10 +1549,8 @@ struct AlarmContext {
 
 async fn alarm_watcher(ctx: AlarmContext) {
     let mut last_fired: Vec<(String, String)> = Vec::new();
-
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
-
         let now_hm = match local_time_hm() { Some(t) => t, None => continue };
         let today = local_date().unwrap_or_default();
         let weekday = local_weekday();
@@ -1836,19 +1578,15 @@ async fn alarm_watcher(ctx: AlarmContext) {
         if dirty { save_alarms(&ctx.store_path, &alarms); }
 
         for (id, time, label) in to_fire {
-            let msg = if label.trim().is_empty() { format!("Alarm at {}", time) }
-            else { format!("Alarm at {}: {}", time, label) };
+            let msg = if label.trim().is_empty() { format!("Alarm at {}", time) } else { format!("Alarm at {}: {}", time, label) };
             info!("Alarm firing ({}): {}", id, msg);
-
             ctx.led.send(LedCommand::SetState(LedState::Alarm));
             let cfg = ctx.groq.read().await.clone();
             match tts(&ctx.client, &cfg, &msg, &cfg.tts_voice).await {
                 Ok(audio) => {
                     ctx.is_playing.store(true, Ordering::SeqCst);
                     let stop = ctx.stop_playback.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let _ = play_audio_bytes(audio, &stop);
-                    }).await;
+                    let _ = tokio::task::spawn_blocking(move || { let _ = play_audio_bytes(audio, &stop); }).await;
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     ctx.is_playing.store(false, Ordering::SeqCst);
                     ctx.led.send(LedCommand::SetState(LedState::Idle));
@@ -1857,10 +1595,7 @@ async fn alarm_watcher(ctx: AlarmContext) {
             }
         }
 
-        if last_fired.len() > 200 {
-            let drop = last_fired.len() - 200;
-            last_fired.drain(0..drop);
-        }
+        if last_fired.len() > 200 { let drop = last_fired.len() - 200; last_fired.drain(0..drop); }
     }
 }
 
@@ -1876,7 +1611,6 @@ async fn test_mic(config: &AudioConfig, mic_gain: Arc<AtomicU32>) -> Result<()> 
     let start = std::time::Instant::now();
     let mut max_rms: f32 = 0.0;
     let mut total_samples: usize = 0;
-
     use std::io::Write;
     while start.elapsed() < Duration::from_secs(3) {
         if let Ok(Some(chunk)) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
@@ -1907,21 +1641,13 @@ fn test_speaker() -> Result<()> {
     let duration = 2.0f32;
     let freq = 440.0f32;
     let n = (sample_rate as f32 * duration) as usize;
-    let samples: Vec<f32> = (0..n)
-        .map(|i| {
-            let t = i as f32 / sample_rate as f32;
-            (2.0 * std::f32::consts::PI * freq * t).sin() * 0.3
-        })
-        .collect();
+    let samples: Vec<f32> = (0..n).map(|i| {
+        let t = i as f32 / sample_rate as f32;
+        (2.0 * std::f32::consts::PI * freq * t).sin() * 0.3
+    }).collect();
     let spec = WavSpec { channels: 1, sample_rate, bits_per_sample: 16, sample_format: HoundSampleFormat::Int };
     let mut cursor = Cursor::new(Vec::new());
-    {
-        let mut w = WavWriter::new(&mut cursor, spec)?;
-        for &s in &samples {
-            w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)?;
-        }
-        w.finalize()?;
-    }
+    { let mut w = WavWriter::new(&mut cursor, spec)?; for &s in &samples { w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)?; } w.finalize()?; }
     let bytes = cursor.into_inner();
     let stop = Arc::new(AtomicBool::new(false));
     play_audio_bytes(bytes, &stop)?;
@@ -1932,15 +1658,9 @@ fn test_speaker() -> Result<()> {
 async fn test_volume(config: &AudioConfig) -> Result<()> {
     println!();
     println!("[Volume Test]");
-    match amixer_get(config).await {
-        Ok(v) => println!("  Current: {}%", v),
-        Err(e) => println!("  Cannot read: {}", e),
-    }
+    match amixer_get(config).await { Ok(v) => println!("  Current: {}%", v), Err(e) => println!("  Cannot read: {}", e) }
     for pct in [20u32, 80, 50] {
-        match amixer_set(config, pct).await {
-            Ok(actual) => println!("  Set to {}%", actual),
-            Err(e) => println!("  Failed: {}", e),
-        }
+        match amixer_set(config, pct).await { Ok(a) => println!("  Set to {}%", a), Err(e) => println!("  Failed: {}", e) }
         tokio::time::sleep(Duration::from_millis(800)).await;
     }
     println!("  [OK] Volume test done.");
@@ -1950,7 +1670,6 @@ async fn test_volume(config: &AudioConfig) -> Result<()> {
 fn test_keys(config: &KeysConfig) -> Result<()> {
     if !config.enabled { println!(); println!("[Keys Test] Disabled in config"); return Ok(()); }
     if !PathBuf::from(&config.device).exists() { println!(); println!("[Keys Test] Device {} not found", config.device); return Ok(()); }
-
     println!();
     println!("[Keys Test] Listening on {} for 15 seconds", config.device);
     use std::io::Read;
@@ -1993,10 +1712,7 @@ async fn test_network(client: &reqwest::Client, proxy_url: &str) -> Result<()> {
             let status = resp.status().as_u16();
             if status == 200 {
                 if let Ok(info) = resp.json::<IpApiResponse>().await {
-                    println!("  [OK] IP: {} ({}, {})",
-                             info.query.as_deref().unwrap_or("?"),
-                             info.city.as_deref().unwrap_or("?"),
-                             info.country.as_deref().unwrap_or("?"));
+                    println!("  [OK] IP: {} ({}, {})", info.query.as_deref().unwrap_or("?"), info.city.as_deref().unwrap_or("?"), info.country.as_deref().unwrap_or("?"));
                 }
             } else { println!("  [WARN] HTTP {}", status); }
         }
@@ -2014,9 +1730,7 @@ async fn test_groq(client: &reqwest::Client, config: &GroqConfig) -> Result<()> 
             println!("  [OK] API key valid");
             if let Ok(models) = r.json::<ModelsResponse>().await {
                 let ids: Vec<String> = models.data.iter().map(|m| m.id.clone()).collect();
-                for (label, id) in [
-                    ("STT", &config.stt_model), ("LLM", &config.llm_model), ("TTS", &config.tts_model),
-                ] {
+                for (label, id) in [("STT", &config.stt_model), ("LLM", &config.llm_model), ("TTS", &config.tts_model)] {
                     if ids.iter().any(|i| i == id) { println!("  [OK] {} model: {}", label, id); }
                     else { println!("  [WARN] {} model not available: {}", label, id); }
                 }
@@ -2038,26 +1752,78 @@ fn test_led(config: &LedConfig) -> Result<()> {
     println!("[LED Test]");
     if !config.enabled { println!("  [SKIP] LED disabled in config"); return Ok(()); }
     println!("  Device: {}", config.device);
-    if !PathBuf::from(&config.device).exists() {
-        println!("  [FAIL] Device not found");
-        return Ok(());
-    }
-    let colors_sequence: [(u32, &str); 4] = [
-        (0x0000FF, "red"), (0x00FF00, "green"),
-        (0xFF0000, "blue"), (0xFFFFFF, "white"),
+    if !PathBuf::from(&config.device).exists() { println!("  [FAIL] Device not found"); return Ok(()); }
+
+    println!();
+    println!("  Phase 1: full ring primary colors");
+    let primaries: [(u32, &str); 4] = [
+        (0x0000FF, "red"), (0x00FF00, "green"), (0xFF0000, "blue"), (0xFFFFFF, "white"),
     ];
-    for (bgr, name) in colors_sequence {
+    for (bgr, name) in primaries {
+        println!("    -> all LEDs = {}", name);
         let arr = [bgr; LED_COUNT];
-        println!("  Setting all LEDs to {}", name);
-        if let Err(e) = write_leds(&config.device, &arr) {
-            println!("  [FAIL] {}", e);
-            return Ok(());
-        }
+        if let Err(e) = write_leds(&config.device, &arr) { println!("    [FAIL] {}", e); return Ok(()); }
+        std::thread::sleep(Duration::from_millis(600));
+    }
+
+    println!();
+    println!("  Phase 2: individual LED scan (0 to {})", LED_COUNT - 1);
+    for i in 0..LED_COUNT {
+        let mut arr = [0u32; LED_COUNT];
+        arr[i] = 0xFFFFFF;
+        if let Err(e) = write_leds(&config.device, &arr) { println!("    [FAIL] at LED {}: {}", i, e); return Ok(()); }
+        print!("\r    LED {}/{}", i, LED_COUNT - 1);
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        std::thread::sleep(Duration::from_millis(120));
+    }
+    println!();
+
+    println!();
+    println!("  Phase 3: brightness ramp");
+    let base = parse_rgb_hex_to_bgr(&config.idle_color).unwrap_or(0x0000C8);
+    for pct in [10u32, 30, 50, 70, 90, 100, 70, 40, 10] {
+        let scaled = apply_brightness(base, pct as u8);
+        let arr = [scaled; LED_COUNT];
+        let _ = write_leds(&config.device, &arr);
+        print!("\r    brightness {}%", pct);
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    println!();
+
+    println!();
+    println!("  Phase 4: preset states");
+    let states: [(u32, &str); 4] = [
+        (state_to_color(LedState::Idle, config), "idle"),
+        (state_to_color(LedState::Listening, config), "listening"),
+        (state_to_color(LedState::Speaking, config), "speaking"),
+        (state_to_color(LedState::Muted, config), "muted"),
+    ];
+    for (bgr, name) in states {
+        println!("    -> state {}", name);
+        let arr = [bgr; LED_COUNT];
+        let _ = write_leds(&config.device, &arr);
         std::thread::sleep(Duration::from_millis(700));
+    }
+
+    println!();
+    println!("  Phase 5: fade to black");
+    let start = parse_rgb_hex_to_bgr(&config.idle_color).unwrap_or(0x0000C8);
+    for step in (0..=10).rev() {
+        let pct = (step * 10) as u8;
+        let scaled = apply_brightness(start, pct);
+        let arr = [scaled; LED_COUNT];
+        let _ = write_leds(&config.device, &arr);
+        std::thread::sleep(Duration::from_millis(80));
     }
     let off = [0u32; LED_COUNT];
     let _ = write_leds(&config.device, &off);
-    println!("  [OK] LED test done");
+
+    println!();
+    println!("  [OK] LED test complete");
+    println!("  Expected: 18 LEDs scanned one by one, brightness ramp, 4 preset states, fade out");
     Ok(())
 }
 
@@ -2074,7 +1840,6 @@ async fn run_test_command(subcommand: &str, config: &Config, client: &reqwest::C
     println!("============================================================");
     println!("  Rimth Hardware Test: {}", subcommand);
     println!("============================================================");
-
     match subcommand {
         "mic" => test_mic(&config.audio, mic_gain).await?,
         "speaker" => test_speaker()?,
@@ -2094,13 +1859,8 @@ async fn run_test_command(subcommand: &str, config: &Config, client: &reqwest::C
             test_keys(&config.keys)?;
             test_alarms(&config.alarm.store_path)?;
         }
-        other => {
-            eprintln!("Unknown test: {}", other);
-            eprintln!("Available: mic, speaker, volume, keys, network, groq, led, alarms, all");
-            std::process::exit(1);
-        }
+        other => { eprintln!("Unknown test: {}", other); eprintln!("Available: mic, speaker, volume, keys, network, groq, led, alarms, all"); std::process::exit(1); }
     }
-
     println!();
     println!("============================================================");
     println!("  Test complete");
@@ -2110,7 +1870,7 @@ async fn run_test_command(subcommand: &str, config: &Config, client: &reqwest::C
 }
 
 // ---------------------------------------------------------------------------
-// Config loading
+// Config
 // ---------------------------------------------------------------------------
 
 fn load_config_or_default() -> Config {
@@ -2134,6 +1894,24 @@ fn write_default_config() -> Result<()> {
     std::fs::write(&path, toml_str)?;
     println!("Config written to: {}", path.display());
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Global state
+// ---------------------------------------------------------------------------
+
+struct KeyState {
+    muted: Arc<AtomicBool>,
+    stop_playback: Arc<AtomicBool>,
+    conversation_mode: Arc<AtomicBool>,
+}
+
+struct AppState {
+    key_state: Arc<KeyState>,
+    sessions_dir: PathBuf,
+    mic_gain: Arc<AtomicU32>,
+    led: LedHandle,
+    groq: SharedGroq,
 }
 
 // ---------------------------------------------------------------------------
@@ -2202,7 +1980,7 @@ async fn main() -> Result<()> {
 
     let is_playing = Arc::new(AtomicBool::new(false));
     let (tx, mut rx) = channel::<Vec<f32>>(100);
-    let _stream = start_capture(tx, config.audio.sample_rate, mic_gain.clone())?;
+    let capture = CaptureCtx::new(tx.clone(), config.audio.sample_rate, mic_gain.clone())?;
 
     let app_state = Arc::new(AppState {
         key_state: key_state.clone(),
@@ -2251,10 +2029,7 @@ async fn main() -> Result<()> {
         }
 
         let api_key_now = groq.read().await.api_key.clone();
-        if api_key_now.trim().is_empty() {
-            warn!("API key not set, skipping");
-            continue;
-        }
+        if api_key_now.trim().is_empty() { warn!("API key not set, skipping"); continue; }
 
         info!("Recording...");
         let wav_opt = match record(&mut rx, &config.audio, &is_playing, &key_state).await {
@@ -2280,10 +2055,8 @@ async fn main() -> Result<()> {
                 Err(e) => {
                     warn!("STT {}: {}", e.status, e.message);
                     let p = match e.status {
-                        401 | 403 => Prompt::Auth,
-                        429 | 413 => Prompt::RateLimit,
-                        400 | 422 => Prompt::BadRequest,
-                        500 | 502 | 503 => Prompt::Server,
+                        401 | 403 => Prompt::Auth, 429 | 413 => Prompt::RateLimit,
+                        400 | 422 => Prompt::BadRequest, 500 | 502 | 503 => Prompt::Server,
                         _ => Prompt::Server,
                     };
                     play_prompt(p, &key_state.stop_playback).await;
@@ -2307,7 +2080,7 @@ async fn main() -> Result<()> {
             let ok = run_diagnostics(&config, &client).await;
             let reply = if ok { "Diagnostics passed." } else { "Diagnostics found problems." };
             let cfg = groq.read().await.clone();
-            speak(&client, &cfg, reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
+            speak(&client, &cfg, reply, &is_playing, &key_state.stop_playback, &mut rx, &led, &capture).await;
             continue;
         }
 
@@ -2320,7 +2093,7 @@ async fn main() -> Result<()> {
             let reply = format!("New session: {}", current_session);
             info!("{}", reply);
             let cfg = groq.read().await.clone();
-            speak(&client, &cfg, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
+            speak(&client, &cfg, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led, &capture).await;
             continue;
         }
 
@@ -2333,7 +2106,7 @@ async fn main() -> Result<()> {
                 else { format!("Sessions: {}", sessions.join(", ")) };
                 info!("{}", reply);
                 let cfg = groq.read().await.clone();
-                speak(&client, &cfg, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
+                speak(&client, &cfg, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led, &capture).await;
                 continue;
             }
             current_session = name;
@@ -2344,7 +2117,7 @@ async fn main() -> Result<()> {
             let reply = format!("Resumed: {}", current_session);
             info!("{}", reply);
             let cfg = groq.read().await.clone();
-            speak(&client, &cfg, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
+            speak(&client, &cfg, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led, &capture).await;
             continue;
         }
 
@@ -2354,7 +2127,7 @@ async fn main() -> Result<()> {
             else { format!("Sessions: {}", sessions.join(", ")) };
             info!("{}", reply);
             let cfg = groq.read().await.clone();
-            speak(&client, &cfg, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
+            speak(&client, &cfg, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led, &capture).await;
             continue;
         }
 
@@ -2376,19 +2149,11 @@ async fn main() -> Result<()> {
                 Ok(response) => {
                     if let Some(tool_calls) = &response.tool_calls {
                         if !tool_calls.is_empty() {
-                            messages.push(ChatMessage::assistant(
-                                response.content.clone(),
-                                Some(tool_calls.clone()),
-                            ));
+                            messages.push(ChatMessage::assistant(response.content.clone(), Some(tool_calls.clone())));
                             for tc in tool_calls {
-                                let result = execute_tool(
-                                    &client, &config.audio, &config.alarm, &app_state,
-                                    &tc.function.name, &tc.function.arguments,
-                                ).await;
+                                let result = execute_tool(&client, &config.audio, &config.alarm, &app_state, &tc.function.name, &tc.function.arguments).await;
                                 info!("Tool ({}): {}", tc.function.name, result);
-                                messages.push(ChatMessage::tool(
-                                    tc.id.clone(), tc.function.name.clone(), result,
-                                ));
+                                messages.push(ChatMessage::tool(tc.id.clone(), tc.function.name.clone(), result));
                             }
                             continue;
                         }
@@ -2405,7 +2170,6 @@ async fn main() -> Result<()> {
                     else { Prompt::Server };
                     led.send(LedCommand::StopThinking);
                     play_prompt(p, &key_state.stop_playback).await;
-                    // On 400 due to Harmony encoding, clear history to recover.
                     if msg.contains("Tools should have a name") {
                         warn!("History corrupted (harmony encoding). Trimming tool messages.");
                         messages = sanitize_session(messages);
@@ -2424,6 +2188,6 @@ async fn main() -> Result<()> {
 
         info!("Synthesizing...");
         let cfg = groq.read().await.clone();
-        speak(&client, &cfg, &assistant_text, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
+        speak(&client, &cfg, &assistant_text, &is_playing, &key_state.stop_playback, &mut rx, &led, &capture).await;
     }
 }
