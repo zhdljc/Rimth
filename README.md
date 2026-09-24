@@ -320,6 +320,235 @@ See [Rimth.toml](Rimth.toml) for the full configuration reference.
 ./Rimth test            # Run all tests
 ```
 
+# Rimth.toml Configuration Notes
+
+## General Rules
+
+- **File location**: Must be placed next to the `Rimth` executable (`/data/rimth/Rimth.toml`). The binary looks for it in its own directory, not the current working directory.
+- **Format**: Standard TOML. Strings use double quotes, booleans use `true`/`false`, integers are plain, floats need a decimal point.
+- **Comments**: Use `#`. Inline comments after a value are allowed.
+- **Restart required**: Configuration is loaded only at startup. Any change requires restarting the process.
+- **No BOM, no CRLF issues**: Save as UTF-8 without BOM. Windows editors may add CRLF line endings; prefer LF for the target device.
+
+## `[groq]`
+
+### `api_key`
+- **Must be set** for any AI functionality. Empty string disables all STT/LLM/TTS.
+- Format: `gsk_` prefix followed by a long string.
+- **Never commit this to a public repository.** Add `Rimth.toml` to `.gitignore` and use `Rimth.toml.example` for templates.
+- If leaked, revoke it immediately at https://console.groq.com/keys.
+
+### `stt_model`, `llm_model`, `tts_model`
+- Must be **exact model IDs** as returned by `https://api.groq.com/openai/v1/models`.
+- Case-sensitive.
+- The diagnostics section verifies each model against your account's available list.
+
+### `tts_model` special case
+- `canopylabs/orpheus-v1-english` and `canopylabs/orpheus-arabic-saudi` require **one-time terms acceptance** at:
+  https://console.groq.com/playground?model=canopylabs%2Forpheus-v1-english
+- If not accepted, TTS returns HTTP 400 `model_terms_required`.
+
+### `tts_voice`
+- Only meaningful for Orpheus models.
+- Valid voices for `orpheus-v1-english`: `troy`, `hannah`, `autumn`, `diana`, `austin`, `daniel`.
+- Invalid voice names produce a TTS API error.
+
+### `language`
+- ISO 639-1 code used as a **hint to Whisper STT**, not as a hard constraint.
+- The AI is instructed to reply in the user's actual language, not this value.
+- Use `en` for English, `zh` for Chinese, etc. Wrong hints slightly reduce STT accuracy but do not break anything.
+
+### `system_prompt`
+- Passed to the LLM along with language and model lists. Keep it under ~1500 characters.
+- **Multi-line strings**: Use triple quotes if you want line breaks:
+  ```toml
+  system_prompt = """
+  You are Rimth.
+  Keep answers short.
+  """
+  ```
+  Single-line strings with `\n` are also fine.
+- Avoid quotes inside the string unless escaped (`\"`) or use single quotes (`'...'`).
+
+### `*_models_available` lists
+- These are informational for the AI, not enforced by the code.
+- The AI can call `switch_model` with any name from these lists.
+- If you list an invalid model, the next chat request will fail with `model_not_found`.
+- Keep the lists consistent with what your Groq account actually has access to.
+
+## `[audio]`
+
+### `trigger_threshold`
+- RMS threshold to start recording. Range `0.0` to `1.0`.
+- **Too low** → constant false triggers from ambient noise.
+- **Too high** → never triggers.
+- Typical: `0.03` (quiet room) to `0.10` (noisy environment).
+- The RMS is computed from normalized `f32` samples in `[-1.0, 1.0]`.
+
+### `silence_threshold`
+- Must be **strictly less than** `trigger_threshold`. If equal or greater, recordings will never end automatically.
+- Typical: `0.005`.
+
+### `silence_duration_ms`
+- Milliseconds of continuous silence before recording stops.
+- Too short → cuts off mid-sentence.
+- Too long → feels unresponsive.
+- Recommended: `1500` to `2500`.
+
+### `min_recording_ms`
+- Minimum recording length. Anything shorter is discarded before STT.
+- Set to at least `800` to filter out button-press clicks.
+
+### `sample_rate`
+- Must match what Whisper expects. **16000 Hz is strongly recommended.**
+- Other values (22050, 44100) cause Whisper to resample internally, but 16k avoids the overhead.
+- Do **not** change to 48000 — it doubles audio size for no benefit.
+
+### `mixer_control` and `mic_mixer_control`
+- ALSA mixer control names, verified with:
+  ```bash
+  amixer -c 0 scontrols
+  ```
+- On LX06, the correct name is **`mysoftvol`** (not `Master` or `PCM`).
+- If wrong, volume changes silently fail and only print a warning.
+
+### `max_volume`
+- **Important hardware protection.** Values above 80 risk damaging the small speaker.
+- Range `0-100`. Applied as an upper clamp on every `set_volume` call.
+
+### `card_index`
+- ALSA card number. Almost always `0` on LX06.
+- Verify with `cat /proc/asound/cards`.
+
+### `mic_gain`
+- Software multiplier applied to mic samples in the cpal callback.
+- Range: `0.1` to `10.0`. Default `1.0` (no amplification).
+- Values above `3.0` may clip loud speech; values below `0.5` make speech inaudible.
+- AI can override this at runtime via `set_mic_gain`.
+
+## `[gpio]`
+
+- **Legacy section.** LX06 does not use GPIO for the mute button.
+- Always keep `enabled = false` on LX06.
+- Only enable this on older models that expose a sysfs GPIO for mute.
+
+## `[keys]`
+
+### `enabled`
+- Set to `false` to disable hardware key handling entirely.
+
+### `device`
+- The input device node. For LX06, `/dev/input/event0` is correct.
+- Verify with `cat /proc/bus/input/devices`.
+- If the file doesn't exist, the key listener silently exits.
+
+### `mute`, `volume_up`, `volume_down`, `play_pause`
+- Linux key codes (not ASCII). **Must match the actual hardware**.
+- Wrong codes cause the wrong action to trigger (e.g. pressing vol+ mutes the mic).
+- Verify with `./Rimth test keys` and press each button.
+
+### `volume_step`
+- Percentage change per vol+ / vol- press. Range `1-20`.
+- Higher values feel jumpy; lower values require many presses.
+
+## `[proxy]`
+
+### `url`
+- Empty string = direct connection.
+- **Required for users in mainland China and Hong Kong.** Groq blocks those regions.
+- Supported schemes:
+  - `http://host:port` — HTTP CONNECT proxy
+  - `socks5://host:port` — SOCKS5 with local DNS
+  - `socks5h://host:port` — SOCKS5 with remote DNS (more reliable when local DNS is poisoned)
+- **Do not include a trailing slash.**
+- Example: `url = "http://192.168.1.133:1080"`
+
+### Common pitfalls
+- If the proxy is on another machine, that machine must allow LAN connections (bind to `0.0.0.0`, not `127.0.0.1`) and its firewall must permit the port.
+- A running `kaspersky` or similar security suite can silently block LAN traffic to the proxy port.
+
+## `[session]`
+
+### `persist_dir`
+- Empty string → defaults to `<exe_dir>/sessions/`.
+- Set to an absolute path to store sessions elsewhere.
+
+### `max_history`
+- Maximum number of messages kept per session (system prompt excluded).
+- **Lower values reduce token usage and avoid TPM rate limits.**
+- Groq free tier `openai/gpt-oss-20b` has **8000 TPM limit**. With history plus tools plus system prompt, each request consumes 3000-4500 tokens.
+- Recommended: **`20` to `30`**. Values above `50` risk frequent 429 errors.
+- Old messages are dropped from the front when the limit is exceeded.
+
+## `[diagnostics]`
+
+### `run_on_startup`
+- When `true`, runs a full check on every launch. Adds ~5-10 seconds to startup.
+- Set `false` for faster boot once you've verified everything works.
+
+### `test_tts_on_startup`
+- When `true`, also performs a TTS synthesis round-trip during diagnostics. **Consumes API credits.**
+- Leave `false` unless debugging TTS specifically.
+
+## `[led]`
+
+### `enabled`
+- Set `false` to disable LED control entirely (LED worker won't start).
+
+### `device`
+- **Must be** `/sys/devices/i2c-0/0-003a/led_rgb` on LX06.
+- Path `/sys/class/leds/xiaomi:rgb:status` does not exist on LX06 and will cause the LED worker to disable itself.
+- Verify with:
+  ```bash
+  ls /sys/devices/i2c-0/0-003a/
+  ```
+
+### `brightness`
+- Range `0-100`. Applied as a software multiplier on top of every frame.
+- **Does not touch the hardware `led_imax` register.**
+- Values above `70` may be uncomfortably bright at night.
+
+### Color fields (`idle_color`, `listening_color`, `speaking_color`, `muted_color`, `thinking_color`)
+- Format: `RRGGBB` hex, **no `#` prefix, no `0x`**.
+- Case-insensitive (`FF00AA` and `ff00aa` are the same).
+- The code converts to BGR internally for the AW20054 driver.
+- Colors that are too saturated will look washed out due to the brightness multiplier.
+
+### `thinking_color`
+- Only used during the rotating animation while the LLM is generating a reply.
+- A bright purple or warm orange works well visually.
+
+## `[alarm]`
+
+### `store_path`
+- Path to the JSON file where alarms are persisted.
+- The parent directory is created automatically if missing.
+- Format: a JSON array of objects with `id`, `time`, `label`, `repeat`, `enabled`.
+- Safe to edit manually while the program is not running.
+- Falsy IDs (`alarm_1`, `alarm_2`, ...) are assigned automatically.
+
+## Common Failures Checklist
+
+| Symptom | Likely cause |
+|:---|:---|
+| `Permission denied` on config | Wrong owner or mode; chmod to 644 |
+| `Parse error` | Missing quote, stray comma, CRLF line endings |
+| LED writes fail silently | `led.device` path wrong or file is read-only |
+| Volume changes do nothing | `mixer_control` name wrong |
+| STT always returns empty | `trigger_threshold` too high, or mic gain 0 |
+| `429 rate_limit_exceeded` | `max_history` too high, or `max_tokens` too large |
+| `400 Tools should have a name` | Corrupted session history — delete `sessions/*.json` |
+| `model_terms_required` | TTS terms not accepted at Groq console |
+| Proxy connects but API fails | Wrong scheme (`http` vs `socks5`), or DNS resolution issue |
+| Alarm doesn't fire | Device timezone wrong — run `date` and fix `/etc/timezone` |
+
+## Security Reminders
+
+- **Never commit `Rimth.toml`** with a real `api_key`. Add it to `.gitignore`.
+- The `run_terminal` tool allows arbitrary shell execution. Consider restricting it in production.
+- If using a proxy, ensure it's on a trusted network segment.
+- Back up `sessions/` and `alarms.json` before major upgrades.
+
 ## Usage Examples
 
 - "Set volume to 30"
