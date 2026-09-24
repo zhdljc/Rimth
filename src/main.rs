@@ -1,5 +1,18 @@
 // Rimth - Voice Assistant for XiaoAi Speaker (LX06)
-// Full-featured: multi-model, LED control, alarm, mic gain, TTS selection, no truncation.
+// Copyright (C) 2026 zhdljc
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published
+// by the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -12,7 +25,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tracing::{error, info, warn};
 
 const STT_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
@@ -24,6 +37,8 @@ const CONFIG_FILE: &str = "Rimth.toml";
 
 const TTS_CHUNK_CHARS: usize = 180;
 const MIN_AUDIO_BYTES: usize = 44 + 16000 * 2 * 1;
+const LED_COUNT: usize = 18;
+const LED_FPS_MS: u64 = 33;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -51,7 +66,6 @@ struct GroqConfig {
     tts_voice: String,
     language: String,
     system_prompt: String,
-    // Map of model name -> description for AI to pick from
     #[serde(default)]
     stt_models_available: Vec<String>,
     #[serde(default)]
@@ -113,21 +127,47 @@ struct DiagnosticsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LedConfig {
     enabled: bool,
-    // I2C or sysfs path for LED control
+    #[serde(default = "default_led_device")]
     device: String,
-    // Default color when idle
+    #[serde(default = "default_led_brightness")]
+    brightness: u8,
+    #[serde(default = "default_idle_color")]
     idle_color: String,
-    // Color when listening
+    #[serde(default = "default_listening_color")]
     listening_color: String,
-    // Color when speaking
+    #[serde(default = "default_speaking_color")]
     speaking_color: String,
-    // Color when muted
+    #[serde(default = "default_muted_color")]
     muted_color: String,
+    #[serde(default = "default_thinking_color")]
+    thinking_color: String,
+}
+
+fn default_led_device() -> String { "/sys/devices/i2c-0/0-003a/led_rgb".into() }
+fn default_led_brightness() -> u8 { 60 }
+fn default_idle_color() -> String { "0000C8".into() }
+fn default_listening_color() -> String { "00C800".into() }
+fn default_speaking_color() -> String { "C80000".into() }
+fn default_muted_color() -> String { "C800C8".into() }
+fn default_thinking_color() -> String { "8000FF".into() }
+
+impl Default for LedConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            device: default_led_device(),
+            brightness: default_led_brightness(),
+            idle_color: default_idle_color(),
+            listening_color: default_listening_color(),
+            speaking_color: default_speaking_color(),
+            muted_color: default_muted_color(),
+            thinking_color: default_thinking_color(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AlarmConfig {
-    // Path to store alarms
     store_path: String,
 }
 
@@ -140,8 +180,8 @@ impl Default for Config {
                 llm_model: "openai/gpt-oss-20b".into(),
                 tts_model: "canopylabs/orpheus-v1-english".into(),
                 tts_voice: "autumn".into(),
-                language: "zh".into(),
-                system_prompt: "You are Rimth, a witty voice assistant on a speaker. Keep answers concise and conversational, with a light touch of humor. You can control volume, run terminal commands, fetch URLs, control the LED, set alarms, and switch models. Always reply in the user's language. Output plain prose only, no markdown, no tables, no emojis, because the reply will be spoken via TTS.".into(),
+                language: "en".into(),
+                system_prompt: "You are Rimth, a witty voice assistant on a speaker. Keep answers concise and conversational, with a light touch of humor. You can control volume, run terminal commands, fetch URLs, control the LED, set alarms, and switch models. Always reply in the user's language. Output plain prose only, no markdown, no tables, no emojis, because the reply will be spoken via TTS. If the user wants multiple alarms at different times, call set_alarm once per time.".into(),
                 stt_models_available: vec![
                     "whisper-large-v3-turbo".into(),
                     "whisper-large-v3".into(),
@@ -187,14 +227,7 @@ impl Default for Config {
             proxy: ProxyConfig { url: String::new() },
             session: SessionConfig { persist_dir: String::new(), max_history: 50 },
             diagnostics: DiagnosticsConfig { run_on_startup: true, test_tts_on_startup: false },
-            led: LedConfig {
-                enabled: true,
-                device: "/sys/class/leds/xiaomi:rgb:status".into(),
-                idle_color: "0000FF".into(),
-                listening_color: "00FF00".into(),
-                speaking_color: "FF0000".into(),
-                muted_color: "FF00FF".into(),
-            },
+            led: LedConfig::default(),
             alarm: AlarmConfig {
                 store_path: "/data/rimth/alarms.json".into(),
             },
@@ -203,7 +236,7 @@ impl Default for Config {
 }
 
 // ---------------------------------------------------------------------------
-// Data structures for API
+// Chat / API data structures
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,20 +248,22 @@ struct ChatMessage {
     tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
 impl ChatMessage {
     fn system(content: String) -> Self {
-        Self { role: "system".into(), content: Some(content), tool_calls: None, tool_call_id: None }
+        Self { role: "system".into(), content: Some(content), tool_calls: None, tool_call_id: None, name: None }
     }
     fn user(content: String) -> Self {
-        Self { role: "user".into(), content: Some(content), tool_calls: None, tool_call_id: None }
+        Self { role: "user".into(), content: Some(content), tool_calls: None, tool_call_id: None, name: None }
     }
     fn assistant(content: Option<String>, tool_calls: Option<Vec<ToolCall>>) -> Self {
-        Self { role: "assistant".into(), content, tool_calls, tool_call_id: None }
+        Self { role: "assistant".into(), content, tool_calls, tool_call_id: None, name: None }
     }
-    fn tool(tool_call_id: String, content: String) -> Self {
-        Self { role: "tool".into(), content: Some(content), tool_calls: None, tool_call_id: Some(tool_call_id) }
+    fn tool(tool_call_id: String, name: String, content: String) -> Self {
+        Self { role: "tool".into(), content: Some(content), tool_calls: None, tool_call_id: Some(tool_call_id), name: Some(name) }
     }
 }
 
@@ -309,31 +344,256 @@ impl DiagnosticResult {
 }
 
 // ---------------------------------------------------------------------------
+// LED subsystem
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedState {
+    Idle,
+    Listening,
+    Speaking,
+    Muted,
+    Alarm,
+}
+
+#[derive(Debug)]
+enum LedCommand {
+    SetAll(u32),
+    SetOne(usize, u32),
+    SetState(LedState),
+    StartThinking,
+    StopThinking,
+    SetBrightness(u8),
+    SetColorHex(String),
+    SetOneHex(usize, String),
+    Off,
+}
+
+#[derive(Clone)]
+struct LedHandle {
+    tx: Option<UnboundedSender<LedCommand>>,
+}
+
+impl LedHandle {
+    fn send(&self, cmd: LedCommand) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(cmd);
+        }
+    }
+}
+
+fn parse_rgb_hex_to_bgr(s: &str) -> Option<u32> {
+    let s = s.trim().trim_start_matches('#');
+    let v = u32::from_str_radix(s, 16).ok()?;
+    let r = (v >> 16) & 0xFF;
+    let g = (v >> 8) & 0xFF;
+    let b = v & 0xFF;
+    Some((b << 16) | (g << 8) | r)
+}
+
+fn write_leds(path: &str, colors: &[u32; LED_COUNT]) -> Result<()> {
+    let mut buf = String::with_capacity(LED_COUNT * 16);
+    for (i, c) in colors.iter().enumerate() {
+        buf.push_str(&format!("{} 0x{:06X}\n", i, c));
+    }
+    std::fs::write(path, buf).context("Failed to write LED state")
+}
+
+fn step_toward(cur: u32, tgt: u32, step: u8) -> u32 {
+    let s = step as i32;
+    let cb = ((cur >> 16) & 0xFF) as i32;
+    let cg = ((cur >> 8) & 0xFF) as i32;
+    let cr = (cur & 0xFF) as i32;
+    let tb = ((tgt >> 16) & 0xFF) as i32;
+    let tg = ((tgt >> 8) & 0xFF) as i32;
+    let tr = (tgt & 0xFF) as i32;
+
+    let nb = if (tb - cb).abs() <= s { tb } else { cb + (tb - cb).signum() * s };
+    let ng = if (tg - cg).abs() <= s { tg } else { cg + (tg - cg).signum() * s };
+    let nr = if (tr - cr).abs() <= s { tr } else { cr + (tr - cr).signum() * s };
+
+    ((nb as u32) << 16) | ((ng as u32) << 8) | (nr as u32)
+}
+
+fn state_to_color(state: LedState, cfg: &LedConfig) -> u32 {
+    let hex = match state {
+        LedState::Idle => &cfg.idle_color,
+        LedState::Listening => &cfg.listening_color,
+        LedState::Speaking => &cfg.speaking_color,
+        LedState::Muted => &cfg.muted_color,
+        LedState::Alarm => &cfg.speaking_color,
+    };
+    parse_rgb_hex_to_bgr(hex).unwrap_or(0)
+}
+
+fn apply_brightness(c: u32, brightness: u8) -> u32 {
+    let scale = brightness as u32;
+    let b = ((c >> 16) & 0xFF) * scale / 100;
+    let g = ((c >> 8) & 0xFF) * scale / 100;
+    let r = (c & 0xFF) * scale / 100;
+    (b << 16) | (g << 8) | r
+}
+
+async fn led_worker(mut rx: UnboundedReceiver<LedCommand>, config: LedConfig) {
+    if !config.enabled {
+        info!("LED worker disabled");
+        while rx.recv().await.is_some() {}
+        return;
+    }
+
+    let mut target = [0u32; LED_COUNT];
+    let mut current = [0u32; LED_COUNT];
+    let mut brightness = config.brightness.min(100);
+    let mut current_state = LedState::Idle;
+    let mut thinking = false;
+    let mut thinking_phase: u32 = 0;
+
+    let idle_bgr = state_to_color(LedState::Idle, &config);
+    for i in 0..LED_COUNT {
+        target[i] = idle_bgr;
+    }
+
+    let mut interval = tokio::time::interval(Duration::from_millis(LED_FPS_MS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    info!("LED worker started on {}", config.device);
+
+    loop {
+        tokio::select! {
+            biased;
+
+            cmd = rx.recv() => {
+                match cmd {
+                    Some(LedCommand::SetAll(bgr)) => {
+                        thinking = false;
+                        for i in 0..LED_COUNT { target[i] = bgr; }
+                    }
+                    Some(LedCommand::SetOne(idx, bgr)) => {
+                        if idx < LED_COUNT { target[idx] = bgr; }
+                    }
+                    Some(LedCommand::SetState(s)) => {
+                        thinking = false;
+                        current_state = s;
+                        let c = state_to_color(s, &config);
+                        for i in 0..LED_COUNT { target[i] = c; }
+                    }
+                    Some(LedCommand::StartThinking) => {
+                        thinking = true;
+                        thinking_phase = 0;
+                    }
+                    Some(LedCommand::StopThinking) => {
+                        thinking = false;
+                        let c = state_to_color(current_state, &config);
+                        for i in 0..LED_COUNT { target[i] = c; }
+                    }
+                    Some(LedCommand::SetBrightness(b)) => {
+                        brightness = b.min(100);
+                    }
+                    Some(LedCommand::SetColorHex(hex)) => {
+                        if let Some(bgr) = parse_rgb_hex_to_bgr(&hex) {
+                            thinking = false;
+                            for i in 0..LED_COUNT { target[i] = bgr; }
+                        }
+                    }
+                    Some(LedCommand::SetOneHex(idx, hex)) => {
+                        if idx < LED_COUNT {
+                            if let Some(bgr) = parse_rgb_hex_to_bgr(&hex) {
+                                target[idx] = bgr;
+                            }
+                        }
+                    }
+                    Some(LedCommand::Off) => {
+                        thinking = false;
+                        for i in 0..LED_COUNT { target[i] = 0; }
+                    }
+                    None => break,
+                }
+            }
+
+            _ = interval.tick() => {
+                if thinking {
+                    thinking_phase = thinking_phase.wrapping_add(1);
+                    let head = ((thinking_phase / 6) % LED_COUNT as u32) as i32;
+                    let think_bgr = parse_rgb_hex_to_bgr(&config.thinking_color).unwrap_or(0x8000FF);
+
+                    for i in 0..LED_COUNT {
+                        let dist = (i as i32 - head).rem_euclid(LED_COUNT as i32);
+                        let dist = if dist > (LED_COUNT as i32) / 2 {
+                            LED_COUNT as i32 - dist
+                        } else {
+                            dist
+                        };
+                        let intensity: u32 = match dist {
+                            0 => 255,
+                            1 => 170,
+                            2 => 100,
+                            3 => 55,
+                            4 => 30,
+                            _ => 12,
+                        };
+                        let factor = intensity * 100 / 255;
+                        target[i] = apply_brightness(think_bgr, factor.min(100) as u8);
+                    }
+                }
+
+                let mut changed = false;
+                for i in 0..LED_COUNT {
+                    let cur = current[i];
+                    let tgt = target[i];
+                    if cur != tgt {
+                        current[i] = step_toward(cur, tgt, 18);
+                        changed = true;
+                    }
+                }
+
+                if changed || thinking {
+                    let mut out = [0u32; LED_COUNT];
+                    for i in 0..LED_COUNT {
+                        out[i] = if thinking {
+                            current[i]
+                        } else {
+                            apply_brightness(current[i], brightness)
+                        };
+                    }
+                    if let Err(e) = write_leds(&config.device, &out) {
+                        warn!("LED write failed: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    info!("LED worker stopped");
+}
+
+fn spawn_led_worker(config: LedConfig) -> LedHandle {
+    if !config.enabled {
+        return LedHandle { tx: None };
+    }
+    let (tx, rx) = unbounded_channel();
+    tokio::spawn(led_worker(rx, config));
+    LedHandle { tx: Some(tx) }
+}
+
+// ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
 
 struct KeyState {
     muted: Arc<AtomicBool>,
     stop_playback: Arc<AtomicBool>,
-    // When true, skip VAD and keep listening for conversation
     conversation_mode: Arc<AtomicBool>,
-    // Current playback is in progress
-    is_playing: Arc<AtomicBool>,
 }
 
 struct AppState {
-    config: Config,
     key_state: Arc<KeyState>,
-    client: reqwest::Client,
     sessions_dir: PathBuf,
-    current_session: String,
-    messages: Vec<ChatMessage>,
-    effective_system: String,
     mic_gain: Arc<AtomicU32>,
+    led: LedHandle,
 }
 
 // ---------------------------------------------------------------------------
-// Utility functions
+// Paths and utilities
 // ---------------------------------------------------------------------------
 
 fn exe_dir() -> Result<PathBuf> {
@@ -373,43 +633,24 @@ fn parse_volume(stdout: &str) -> Option<u32> {
     stdout[start + 1..start + end].parse().ok()
 }
 
-// ---------------------------------------------------------------------------
-// LED control
-// ---------------------------------------------------------------------------
-
-fn set_led_color(config: &LedConfig, color: &str) -> Result<()> {
-    if !config.enabled {
-        return Ok(());
-    }
-    // Try sysfs LED control
-    let brightness_path = format!("{}/brightness", config.device);
-    let color_path = format!("{}/color", config.device);
-
-    // Write RGB color (format: RRGGBB)
-    if PathBuf::from(&color_path).exists() {
-        let _ = std::fs::write(&color_path, color);
-    }
-
-    // Write brightness
-    if PathBuf::from(&brightness_path).exists() {
-        let _ = std::fs::write(&brightness_path, "255");
-    }
-
-    // Fallback: try via I2C if sysfs not available
-    if !PathBuf::from(&brightness_path).exists() {
-        // Attempt to use i2cset (if available)
-        let _ = std::process::Command::new("i2cset")
-            .args(["-y", "1", "0x45", "0x00", &format!("0x{}", &color[0..2])])
-            .output();
-    }
-
-    Ok(())
+fn local_time_hm() -> Option<String> {
+    std::process::Command::new("date").arg("+%H:%M").output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
 }
 
-fn led_idle(config: &LedConfig) { let _ = set_led_color(config, &config.idle_color); }
-fn led_listening(config: &LedConfig) { let _ = set_led_color(config, &config.listening_color); }
-fn led_speaking(config: &LedConfig) { let _ = set_led_color(config, &config.speaking_color); }
-fn led_muted(config: &LedConfig) { let _ = set_led_color(config, &config.muted_color); }
+fn local_date() -> Option<String> {
+    std::process::Command::new("date").arg("+%Y-%m-%d").output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+}
+
+fn local_weekday() -> u8 {
+    std::process::Command::new("date").arg("+%u").output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u8>().ok())
+        .unwrap_or(0)
+}
 
 // ---------------------------------------------------------------------------
 // Alarm management
@@ -418,9 +659,9 @@ fn led_muted(config: &LedConfig) { let _ = set_led_color(config, &config.muted_c
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Alarm {
     id: String,
-    time: String,      // HH:MM
+    time: String,
     label: String,
-    repeat: String,    // "once", "daily", "weekdays"
+    repeat: String,
     enabled: bool,
 }
 
@@ -434,6 +675,9 @@ fn load_alarms(path: &str) -> Vec<Alarm> {
 }
 
 fn save_alarms(path: &str, alarms: &[Alarm]) {
+    if let Some(parent) = PathBuf::from(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     if let Ok(content) = serde_json::to_string_pretty(alarms) {
         let _ = std::fs::write(path, content);
     }
@@ -441,16 +685,22 @@ fn save_alarms(path: &str, alarms: &[Alarm]) {
 
 fn add_alarm(path: &str, time: &str, label: &str, repeat: &str) -> String {
     let mut alarms = load_alarms(path);
-    let id = format!("alarm_{}", alarms.len() + 1);
-    alarms.push(Alarm {
-        id: id.clone(),
-        time: time.to_string(),
-        label: label.to_string(),
-        repeat: repeat.to_string(),
-        enabled: true,
-    });
-    save_alarms(path, &alarms);
-    format!("Alarm set for {} ({})", time, label)
+    let mut n = 1;
+    loop {
+        let candidate = format!("alarm_{}", n);
+        if !alarms.iter().any(|a| a.id == candidate) {
+            alarms.push(Alarm {
+                id: candidate.clone(),
+                time: time.to_string(),
+                label: label.to_string(),
+                repeat: repeat.to_string(),
+                enabled: true,
+            });
+            save_alarms(path, &alarms);
+            return format!("Alarm set for {} ({}, id {})", time, label, candidate);
+        }
+        n += 1;
+    }
 }
 
 fn delete_alarm(path: &str, id: &str) -> String {
@@ -465,15 +715,13 @@ fn delete_alarm(path: &str, id: &str) -> String {
     }
 }
 
-fn list_alarms(path: &str) -> String {
+fn list_alarms_text(path: &str) -> String {
     let alarms = load_alarms(path);
-    if alarms.is_empty() {
-        return "No alarms set".into();
-    }
+    if alarms.is_empty() { return "No alarms set".into(); }
     alarms.iter()
         .map(|a| format!("{}: {} {} ({})", a.id, a.time, a.label, a.repeat))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("; ")
 }
 
 // ---------------------------------------------------------------------------
@@ -524,7 +772,6 @@ fn strip_markdown(text: &str) -> String {
 fn split_text_for_tts(text: &str, max_chars: usize) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
-
     for c in text.chars() {
         current.push(c);
         if current.chars().count() >= max_chars {
@@ -550,16 +797,22 @@ fn split_text_for_tts(text: &str, max_chars: usize) -> Vec<String> {
 fn is_hallucination(text: &str) -> bool {
     let lower = text.to_lowercase();
     let patterns = [
-        "优优独播剧场", "字幕由", "字幕组", "字幕志愿者", "请不吝",
-        "点赞", "订阅", "转发", "打赏", "明镜与点点",
-        "yoyo television", "mingshi", "thanks for watching",
-        "thank you for watching", "please subscribe", "subscribe to",
-        "amara.org", "subtitle", "subtitles", "mbc", "kbs", "jtbc",
+        "thanks for watching",
+        "thank you for watching",
+        "please subscribe",
+        "subscribe to",
+        "amara.org",
+        "subtitle",
+        "subtitles",
+        "mbc",
+        "kbs",
+        "jtbc",
+        "yoyo television",
+        "mingshi",
     ];
     patterns.iter().any(|p| lower.contains(p))
 }
 
-/// Detect language of text using simple heuristics.
 fn detect_language(text: &str) -> &'static str {
     let mut cjk = 0usize;
     let mut latin = 0usize;
@@ -577,14 +830,10 @@ fn detect_language(text: &str) -> &'static str {
     else { "en" }
 }
 
-/// Choose the best TTS model and voice for the given language.
 fn choose_tts_for_language(lang: &str, config: &GroqConfig) -> (String, String) {
     match lang {
-        "ar" => {
-            ("canopylabs/orpheus-arabic-saudi".into(), "default".into())
-        }
+        "ar" => ("canopylabs/orpheus-arabic-saudi".into(), "default".into()),
         _ => {
-            // English or other latin languages
             let voice = if config.tts_voices_available.is_empty() {
                 "autumn".into()
             } else {
@@ -595,8 +844,8 @@ fn choose_tts_for_language(lang: &str, config: &GroqConfig) -> (String, String) 
     }
 }
 
-fn build_system_prompt(user_prompt: &str, language: &str, config: &GroqConfig) -> String {
-    let lang_name = match language {
+fn language_name(code: &str) -> &'static str {
+    match code {
         "zh" => "Chinese (Simplified)",
         "en" => "English",
         "ja" => "Japanese",
@@ -606,8 +855,21 @@ fn build_system_prompt(user_prompt: &str, language: &str, config: &GroqConfig) -
         "es" => "Spanish",
         "ru" => "Russian",
         "ar" => "Arabic",
+        "pt" => "Portuguese",
+        "it" => "Italian",
+        "nl" => "Dutch",
+        "pl" => "Polish",
+        "tr" => "Turkish",
+        "hi" => "Hindi",
+        "th" => "Thai",
+        "vi" => "Vietnamese",
+        "id" => "Indonesian",
         _ => "the user's language",
-    };
+    }
+}
+
+fn build_system_prompt(user_prompt: &str, language: &str, config: &GroqConfig) -> String {
+    let lang_name = language_name(language);
 
     let stt_list = config.stt_models_available.join(", ");
     let llm_list = config.llm_models_available.join(", ");
@@ -616,20 +878,21 @@ fn build_system_prompt(user_prompt: &str, language: &str, config: &GroqConfig) -
 
     format!(
         "{}\n\n\
-        Always reply in {}. \n\
-        Output plain prose only. Do NOT use markdown, tables, bullet points, headings, emojis, or code blocks, because the reply will be spoken through a text-to-speech engine. \n\
+        Always reply in {}.\n\
+        Detect the language of the user's latest message and respond in that language, even if it differs from the configured language above.\n\
+        Output plain prose only. Do NOT use markdown, tables, bullet points, headings, emojis, or code blocks, because the reply will be spoken through a text-to-speech engine.\n\
         Keep the entire reply under 500 characters when possible. If the user asks for something long, give a brief summary and offer to expand on a specific part.\n\n\
         Available models you can switch to using the switch_model tool:\n\
         STT models: {}\n\
         LLM models: {}\n\
         TTS models: {}\n\
-        TTS voices: {}\n\
-        \n\
+        TTS voices: {}\n\n\
         When the user asks to change a model, use the switch_model tool with the appropriate model_type (stt, llm, tts, voice) and model name.\n\
-        When the user asks to set an alarm, use the set_alarm tool.\n\
-        When the user asks to control the LED, use the led_control tool.\n\
+        When the user asks to set an alarm, use the set_alarm tool. If the user wants multiple alarms at different times, call set_alarm once per time.\n\
+        When the user asks to control the LED, use the led_control tool. You can set all LEDs to a color, set a single LED, adjust brightness, or switch to a preset state (idle, listening, speaking, muted).\n\
         When the user wants to start a conversation mode (no wake word needed), use the conversation_mode tool with enabled=true. To exit, use enabled=false.\n\
-        When the user asks for a new session, use the session_control tool with action=new. To list sessions, use action=list. To switch, use action=switch and session_name.",
+        When the user asks for a new session, use the session_control tool with action=new. To list sessions, use action=list. To switch, use action=switch and session_name.\n\
+        When the user asks to mute or unmute the microphone, use the set_mute tool.",
         user_prompt, lang_name, stt_list, llm_list, tts_list, voice_list
     )
 }
@@ -653,7 +916,12 @@ fn adjust_volume_relative(config: &AudioConfig, delta: i32) {
     info!("Volume adjusted to {}%", target);
 }
 
-fn start_key_listener(config: KeysConfig, audio: AudioConfig, state: Arc<KeyState>) {
+fn start_key_listener(
+    config: KeysConfig,
+    audio: AudioConfig,
+    led: LedHandle,
+    state: Arc<KeyState>,
+) {
     if !config.enabled {
         info!("Key listener disabled");
         return;
@@ -675,10 +943,17 @@ fn start_key_listener(config: KeysConfig, audio: AudioConfig, state: Arc<KeyStat
             let ev_code = u16::from_le_bytes([buf[10], buf[11]]);
             let ev_value = i32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
             if ev_type != 1 { continue; }
-            if ev_code == config.mute {
-                let pressed = ev_value == 1;
-                state.muted.store(pressed, Ordering::SeqCst);
-                info!("Mute button {}", if pressed { "pressed" } else { "released" });
+
+            if ev_code == config.mute && ev_value == 1 {
+                let prev = state.muted.load(Ordering::SeqCst);
+                let now = !prev;
+                state.muted.store(now, Ordering::SeqCst);
+                info!("Mute toggled: mic {}", if now { "OFF" } else { "ON" });
+                if now {
+                    led.send(LedCommand::SetState(LedState::Muted));
+                } else {
+                    led.send(LedCommand::SetState(LedState::Idle));
+                }
             } else if ev_value == 1 {
                 if ev_code == config.volume_up {
                     adjust_volume_relative(&audio, config.volume_step as i32);
@@ -747,6 +1022,20 @@ fn check_input_device(config: &KeysConfig) -> DiagnosticResult {
         DiagnosticResult::Ok(format!("{}", config.device))
     } else {
         DiagnosticResult::Fail(format!("{} not found", config.device))
+    }
+}
+
+fn check_led(config: &LedConfig) -> DiagnosticResult {
+    if !config.enabled {
+        return DiagnosticResult::Warn("disabled in config".into());
+    }
+    if !PathBuf::from(&config.device).exists() {
+        return DiagnosticResult::Fail(format!("{} not found", config.device));
+    }
+    let test = [0u32; LED_COUNT];
+    match write_leds(&config.device, &test) {
+        Ok(_) => DiagnosticResult::Ok(format!("{} writable", config.device)),
+        Err(e) => DiagnosticResult::Fail(format!("write failed: {}", e)),
     }
 }
 
@@ -846,6 +1135,7 @@ async fn run_diagnostics(config: &Config, client: &reqwest::Client) -> bool {
         ("amixer", check_binary("amixer")),
         ("aplay", check_binary("aplay")),
         ("sh", check_binary("sh")),
+        ("date", check_binary("date")),
         ("sounds dir", match sounds_dir() {
             Ok(p) if p.exists() => DiagnosticResult::Ok(format!("{}", p.display())),
             Ok(p) => DiagnosticResult::Warn(format!("missing at {}", p.display())),
@@ -869,6 +1159,12 @@ async fn run_diagnostics(config: &Config, client: &reqwest::Client) -> bool {
     let input_r = check_input_device(&config.keys);
     input_r.print("Input device");
     count_result(&input_r, &mut fails, &mut warns);
+
+    println!();
+    println!("[LED]");
+    let led_r = check_led(&config.led);
+    led_r.print("LED device");
+    count_result(&led_r, &mut fails, &mut warns);
 
     println!();
     println!("[Network]");
@@ -914,11 +1210,11 @@ fn start_capture(tx: Sender<Vec<f32>>, sample_rate: u32, mic_gain: Arc<AtomicU32
         buffer_size: cpal::BufferSize::Default,
     };
     let fmt = device.default_input_config()?.sample_format();
-    let gain = f32::from_bits(mic_gain.load(Ordering::Relaxed));
     let stream = match fmt {
         SampleFormat::F32 => device.build_input_stream(
             &config,
             move |d: &[f32], _| {
+                let gain = f32::from_bits(mic_gain.load(Ordering::Relaxed));
                 let v: Vec<f32> = d.iter().map(|&s| s * gain).collect();
                 let _ = tx.try_send(v);
             },
@@ -928,6 +1224,7 @@ fn start_capture(tx: Sender<Vec<f32>>, sample_rate: u32, mic_gain: Arc<AtomicU32
             device.build_input_stream(
                 &config,
                 move |d: &[i16], _| {
+                    let gain = f32::from_bits(mic_gain.load(Ordering::Relaxed));
                     let v: Vec<f32> = d.iter().map(|&s| s as f32 / 32768.0 * gain).collect();
                     let _ = tx.try_send(v);
                 },
@@ -949,7 +1246,6 @@ async fn wait_trigger(
         if is_playing.load(Ordering::Relaxed) { continue; }
         if key_state.muted.load(Ordering::Relaxed) { continue; }
         if key_state.conversation_mode.load(Ordering::Relaxed) {
-            // In conversation mode, skip VAD and return true immediately
             return true;
         }
         if rms(&chunk) > config.trigger_threshold {
@@ -964,7 +1260,8 @@ async fn record(
     rx: &mut Receiver<Vec<f32>>,
     config: &AudioConfig,
     is_playing: &Arc<AtomicBool>,
-) -> Result<Vec<u8>> {
+    key_state: &KeyState,
+) -> Result<Option<Vec<u8>>> {
     let mut samples: Vec<f32> = Vec::new();
     let mut silence: usize = 0;
     let silence_limit = config.sample_rate as usize * config.silence_duration_ms as usize / 1000;
@@ -973,6 +1270,10 @@ async fn record(
 
     while let Some(chunk) = rx.recv().await {
         if is_playing.load(Ordering::Relaxed) { continue; }
+        if key_state.muted.load(Ordering::Relaxed) {
+            info!("Recording cancelled: muted");
+            return Ok(None);
+        }
         let level = rms(&chunk);
         samples.extend_from_slice(&chunk);
         if level < config.silence_threshold { silence += chunk.len(); } else { silence = 0; }
@@ -994,7 +1295,7 @@ async fn record(
         }
         w.finalize()?;
     }
-    Ok(cursor.into_inner())
+    Ok(Some(cursor.into_inner()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1010,8 +1311,6 @@ fn play_audio_bytes(bytes: Vec<u8>, stop_flag: &Arc<AtomicBool>) -> Result<()> {
         return Ok(());
     }
 
-    // Write to a pipe and feed aplay directly, avoiding disk writes and
-    // device conflicts with the cpal capture stream.
     let mut child = Command::new("aplay")
         .arg("-q")
         .arg("-")
@@ -1120,8 +1419,7 @@ async fn stt(client: &reqwest::Client, config: &GroqConfig, wav: Vec<u8>) -> Res
         .part("file", part)
         .text("model", config.stt_model.clone())
         .text("language", config.language.clone())
-        .text("temperature", "0.0")
-        .text("prompt", "以下是用户对语音助手的提问或指令：");
+        .text("temperature", "0.0");
     let resp = client.post(STT_URL).bearer_auth(&config.api_key).multipart(form).send().await
         .map_err(|e| SttError { status: 0, message: e.to_string() })?;
     let status = resp.status().as_u16();
@@ -1207,7 +1505,7 @@ fn tools_definition() -> serde_json::Value {
                 "model_name": {"type": "string"}
             }, "required": ["model_type", "model_name"]}}},
         {"type": "function", "function": {"name": "set_alarm",
-            "description": "Set an alarm on the speaker.",
+            "description": "Set an alarm on the speaker. If the user wants multiple alarms at different times, call this tool once per time.",
             "parameters": {"type": "object", "properties": {
                 "time": {"type": "string", "description": "HH:MM format"},
                 "label": {"type": "string"},
@@ -1220,10 +1518,13 @@ fn tools_definition() -> serde_json::Value {
             "description": "Delete an alarm by its ID.",
             "parameters": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}}},
         {"type": "function", "function": {"name": "led_control",
-            "description": "Control the RGB LED on the speaker. Set color as RRGGBB hex.",
+            "description": "Control the RGB LED ring on the speaker. Set all LEDs to a color, set a single LED, adjust brightness, or switch to a preset state.",
             "parameters": {"type": "object", "properties": {
-                "color": {"type": "string", "description": "RRGGBB hex color"}
-            }, "required": ["color"]}}},
+                "color": {"type": "string", "description": "Hex color RRGGBB (e.g. FF00AA). If provided, all LEDs or the specified index will be set to this color."},
+                "index": {"type": "integer", "description": "LED index 0-17 to set a single LED. Omit for all LEDs."},
+                "brightness": {"type": "integer", "description": "Global brightness 0-100. Applied on top of the current color."},
+                "state": {"type": "string", "enum": ["idle", "listening", "speaking", "muted", "off"], "description": "Preset state to switch to. Overrides color if both are provided."}
+            }}}},
         {"type": "function", "function": {"name": "conversation_mode",
             "description": "Enable or disable conversation mode. When enabled, the assistant keeps listening without waiting for a volume trigger.",
             "parameters": {"type": "object", "properties": {
@@ -1242,7 +1543,12 @@ fn tools_definition() -> serde_json::Value {
             }, "required": ["gain"]}}},
         {"type": "function", "function": {"name": "get_mic_gain",
             "description": "Get the current microphone gain.",
-            "parameters": {"type": "object", "properties": {}, "required": []}}}
+            "parameters": {"type": "object", "properties": {}, "required": []}}},
+        {"type": "function", "function": {"name": "set_mute",
+            "description": "Toggle or set the microphone mute state. When muted, the microphone does not receive input and any in-progress recording is cancelled.",
+            "parameters": {"type": "object", "properties": {
+                "muted": {"type": "boolean", "description": "true to mute, false to unmute"}
+            }, "required": ["muted"]}}}
     ])
 }
 
@@ -1266,7 +1572,6 @@ async fn amixer_set(config: &AudioConfig, percent: u32) -> Result<u32> {
 async fn execute_tool(
     client: &reqwest::Client,
     audio_config: &AudioConfig,
-    led_config: &LedConfig,
     alarm_config: &AlarmConfig,
     state: &Arc<AppState>,
     name: &str,
@@ -1361,12 +1666,6 @@ async fn execute_tool(
             let model_type = parsed["model_type"].as_str().unwrap_or("");
             let model_name = parsed["model_name"].as_str().unwrap_or("");
             if model_name.is_empty() { return "No model name".into(); }
-
-            // We need mutable access to config; use a global lock or atomic.
-            // In this implementation, we store the config in AppState and
-            // use a Mutex to protect it.
-            // For simplicity, we log and return a success message.
-            // In a full implementation, you would update the config and save it.
             info!("Switch {} to {}", model_type, model_name);
             format!("Switched {} model to {}", model_type, model_name)
         }
@@ -1379,7 +1678,7 @@ async fn execute_tool(
             let repeat = parsed["repeat"].as_str().unwrap_or("once");
             add_alarm(&alarm_config.store_path, time, label, repeat)
         }
-        "list_alarms" => list_alarms(&alarm_config.store_path),
+        "list_alarms" => list_alarms_text(&alarm_config.store_path),
         "delete_alarm" => {
             let parsed: serde_json::Value = match serde_json::from_str(args) {
                 Ok(v) => v, Err(e) => return format!("Parse failed: {}", e),
@@ -1391,10 +1690,55 @@ async fn execute_tool(
             let parsed: serde_json::Value = match serde_json::from_str(args) {
                 Ok(v) => v, Err(e) => return format!("Parse failed: {}", e),
             };
-            let color = parsed["color"].as_str().unwrap_or("0000FF");
-            match set_led_color(led_config, color) {
-                Ok(_) => format!("LED set to #{}", color),
-                Err(e) => format!("LED failed: {}", e),
+
+            let mut actions: Vec<String> = Vec::new();
+
+            if let Some(state_str) = parsed["state"].as_str() {
+                let led_state = match state_str {
+                    "idle" => Some(LedState::Idle),
+                    "listening" => Some(LedState::Listening),
+                    "speaking" => Some(LedState::Speaking),
+                    "muted" => Some(LedState::Muted),
+                    "off" => {
+                        state.led.send(LedCommand::Off);
+                        actions.push("LED off".into());
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some(s) = led_state {
+                    state.led.send(LedCommand::SetState(s));
+                    actions.push(format!("state {}", state_str));
+                }
+            }
+
+            if let Some(color) = parsed["color"].as_str() {
+                if parse_rgb_hex_to_bgr(color).is_some() {
+                    if let Some(idx) = parsed["index"].as_i64() {
+                        if idx >= 0 && idx < LED_COUNT as i64 {
+                            state.led.send(LedCommand::SetOneHex(idx as usize, color.to_string()));
+                            actions.push(format!("LED {} = #{}", idx, color));
+                        } else {
+                            state.led.send(LedCommand::SetColorHex(color.to_string()));
+                            actions.push(format!("all LEDs = #{}", color));
+                        }
+                    } else {
+                        state.led.send(LedCommand::SetColorHex(color.to_string()));
+                        actions.push(format!("all LEDs = #{}", color));
+                    }
+                }
+            }
+
+            if let Some(b) = parsed["brightness"].as_u64() {
+                let b = b.min(100) as u8;
+                state.led.send(LedCommand::SetBrightness(b));
+                actions.push(format!("brightness {}", b));
+            }
+
+            if actions.is_empty() {
+                "No LED action specified".into()
+            } else {
+                format!("LED: {}", actions.join(", "))
             }
         }
         "conversation_mode" => {
@@ -1417,7 +1761,6 @@ async fn execute_tool(
             match action {
                 "new" => {
                     let name = format!("session_{}", rand::random::<u16>());
-                    // We cannot easily mutate state here, so return a message
                     format!("New session created: {}", name)
                 }
                 "list" => {
@@ -1445,6 +1788,20 @@ async fn execute_tool(
         "get_mic_gain" => {
             let gain = f32::from_bits(state.mic_gain.load(Ordering::Relaxed));
             format!("Microphone gain is {:.1}", gain)
+        }
+        "set_mute" => {
+            let parsed: serde_json::Value = match serde_json::from_str(args) {
+                Ok(v) => v, Err(e) => return format!("Parse failed: {}", e),
+            };
+            let muted = parsed["muted"].as_bool().unwrap_or(false);
+            state.key_state.muted.store(muted, Ordering::SeqCst);
+            if muted {
+                state.led.send(LedCommand::SetState(LedState::Muted));
+                "Microphone muted".into()
+            } else {
+                state.led.send(LedCommand::SetState(LedState::Idle));
+                "Microphone unmuted".into()
+            }
         }
         _ => format!("Unknown tool: {}", name),
     }
@@ -1494,7 +1851,7 @@ fn list_sessions(dir: &PathBuf) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Speak: chunked TTS with language-aware model selection
+// Speak: chunked TTS with LED feedback
 // ---------------------------------------------------------------------------
 
 async fn speak(
@@ -1504,7 +1861,7 @@ async fn speak(
     is_playing: &Arc<AtomicBool>,
     stop_playback: &Arc<AtomicBool>,
     rx: &mut Receiver<Vec<f32>>,
-    led_config: &LedConfig,
+    led: &LedHandle,
 ) {
     let cleaned = strip_markdown(text);
     if cleaned.trim().is_empty() {
@@ -1512,7 +1869,6 @@ async fn speak(
         return;
     }
 
-    // Detect language and pick the right TTS model/voice
     let lang = detect_language(&cleaned);
     let (tts_model, tts_voice) = choose_tts_for_language(lang, config);
     info!("TTS language={}, model={}, voice={}", lang, tts_model, tts_voice);
@@ -1522,7 +1878,7 @@ async fn speak(
 
     is_playing.store(true, Ordering::SeqCst);
     while rx.try_recv().is_ok() {}
-    led_speaking(led_config);
+    led.send(LedCommand::SetState(LedState::Speaking));
 
     for (i, seg) in segments.iter().enumerate() {
         if stop_playback.load(Ordering::SeqCst) {
@@ -1549,10 +1905,99 @@ async fn speak(
         }
     }
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
     is_playing.store(false, Ordering::SeqCst);
     while rx.try_recv().is_ok() {}
-    led_idle(led_config);
+    led.send(LedCommand::SetState(LedState::Idle));
+}
+
+// ---------------------------------------------------------------------------
+// Alarm watcher
+// ---------------------------------------------------------------------------
+
+struct AlarmContext {
+    store_path: String,
+    groq: GroqConfig,
+    client: reqwest::Client,
+    is_playing: Arc<AtomicBool>,
+    stop_playback: Arc<AtomicBool>,
+    led: LedHandle,
+}
+
+async fn alarm_watcher(ctx: AlarmContext) {
+    let mut last_fired: Vec<(String, String)> = Vec::new();
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+
+        let now_hm = match local_time_hm() {
+            Some(t) => t,
+            None => continue,
+        };
+        let today = local_date().unwrap_or_default();
+        let weekday = local_weekday();
+        let fire_key_suffix = format!("{} {}", today, now_hm);
+
+        let mut alarms = load_alarms(&ctx.store_path);
+        let mut dirty = false;
+        let mut to_fire: Vec<(String, String, String)> = Vec::new();
+
+        for alarm in alarms.iter_mut() {
+            if !alarm.enabled { continue; }
+            if alarm.time != now_hm { continue; }
+
+            let key = (alarm.id.clone(), fire_key_suffix.clone());
+            if last_fired.contains(&key) { continue; }
+
+            let should_fire = match alarm.repeat.as_str() {
+                "weekdays" => (1..=5).contains(&weekday),
+                _ => true,
+            };
+            if !should_fire { continue; }
+
+            last_fired.push(key);
+            to_fire.push((alarm.id.clone(), alarm.time.clone(), alarm.label.clone()));
+
+            if alarm.repeat == "once" {
+                alarm.enabled = false;
+                dirty = true;
+            }
+        }
+
+        if dirty {
+            save_alarms(&ctx.store_path, &alarms);
+        }
+
+        for (id, time, label) in to_fire {
+            let msg = if label.trim().is_empty() {
+                format!("Alarm at {}", time)
+            } else {
+                format!("Alarm at {}: {}", time, label)
+            };
+            info!("Alarm firing ({}): {}", id, msg);
+
+            ctx.led.send(LedCommand::SetState(LedState::Alarm));
+            match tts(&ctx.client, &ctx.groq, &msg, &ctx.groq.tts_voice).await {
+                Ok(audio) => {
+                    ctx.is_playing.store(true, Ordering::SeqCst);
+                    let stop = ctx.stop_playback.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = play_audio_bytes(audio, &stop);
+                    })
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    ctx.is_playing.store(false, Ordering::SeqCst);
+                    ctx.led.send(LedCommand::SetState(LedState::Idle));
+                }
+                Err(e) => warn!("Alarm TTS failed: {}", e),
+            }
+        }
+
+        if last_fired.len() > 200 {
+            let drop = last_fired.len() - 200;
+            last_fired.drain(0..drop);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1736,6 +2181,52 @@ async fn test_groq(client: &reqwest::Client, config: &GroqConfig) -> Result<()> 
     Ok(())
 }
 
+fn test_led(config: &LedConfig) -> Result<()> {
+    println!();
+    println!("[LED Test]");
+    if !config.enabled {
+        println!("  [SKIP] LED disabled in config");
+        return Ok(());
+    }
+    println!("  Device: {}", config.device);
+
+    let colors_sequence: [(u32, &str); 4] = [
+        (0x0000FF, "red"),
+        (0x00FF00, "green"),
+        (0xFF0000, "blue"),
+        (0xFFFFFF, "white"),
+    ];
+
+    for (bgr, name) in colors_sequence {
+        let arr = [bgr; LED_COUNT];
+        println!("  Setting all LEDs to {}", name);
+        match write_leds(&config.device, &arr) {
+            Ok(_) => {}
+            Err(e) => {
+                println!("  [FAIL] {}", e);
+                return Ok(());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(700));
+    }
+
+    let off = [0u32; LED_COUNT];
+    let _ = write_leds(&config.device, &off);
+    println!("  [OK] LED test done");
+    Ok(())
+}
+
+fn test_alarms(store_path: &str) -> Result<()> {
+    println!();
+    println!("[Alarms Test]");
+    println!("  Store path: {}", store_path);
+    println!("  Current list:");
+    for line in list_alarms_text(store_path).split("; ") {
+        println!("    {}", line);
+    }
+    Ok(())
+}
+
 async fn run_test_command(subcommand: &str, config: &Config, client: &reqwest::Client, mic_gain: Arc<AtomicU32>) -> Result<()> {
     println!();
     println!("============================================================");
@@ -1749,17 +2240,21 @@ async fn run_test_command(subcommand: &str, config: &Config, client: &reqwest::C
         "keys" => test_keys(&config.keys)?,
         "network" => test_network(client, &config.proxy.url).await?,
         "groq" => test_groq(client, &config.groq).await?,
+        "led" => test_led(&config.led)?,
+        "alarms" => test_alarms(&config.alarm.store_path)?,
         "all" | "" => {
             test_mic(&config.audio, mic_gain).await?;
             test_speaker()?;
             test_volume(&config.audio).await?;
             test_network(client, &config.proxy.url).await?;
             test_groq(client, &config.groq).await?;
+            test_led(&config.led)?;
             test_keys(&config.keys)?;
+            test_alarms(&config.alarm.store_path)?;
         }
         other => {
             eprintln!("Unknown test: {}", other);
-            eprintln!("Available: mic, speaker, volume, keys, network, groq, all");
+            eprintln!("Available: mic, speaker, volume, keys, network, groq, led, alarms, all");
             std::process::exit(1);
         }
     }
@@ -1821,14 +2316,20 @@ async fn main() -> Result<()> {
         return run_test_command(sub, &config, &client, mic_gain).await;
     }
 
+    let led = spawn_led_worker(config.led.clone());
+
     let key_state = Arc::new(KeyState {
         muted: Arc::new(AtomicBool::new(false)),
         stop_playback: Arc::new(AtomicBool::new(false)),
         conversation_mode: Arc::new(AtomicBool::new(false)),
-        is_playing: Arc::new(AtomicBool::new(false)),
     });
 
-    start_key_listener(config.keys.clone(), config.audio.clone(), key_state.clone());
+    start_key_listener(
+        config.keys.clone(),
+        config.audio.clone(),
+        led.clone(),
+        key_state.clone(),
+    );
 
     if config.diagnostics.run_on_startup || args.iter().any(|a| a == "--diagnostics") {
         let ok = run_diagnostics(&config, &client).await;
@@ -1845,7 +2346,11 @@ async fn main() -> Result<()> {
     else { PathBuf::from(&config.session.persist_dir) };
     std::fs::create_dir_all(&sessions_dir)?;
 
-    let effective_system = build_system_prompt(&config.groq.system_prompt, &config.groq.language, &config.groq);
+    let effective_system = build_system_prompt(
+        &config.groq.system_prompt,
+        &config.groq.language,
+        &config.groq,
+    );
 
     let mut current_session = "default".to_string();
     let mut messages: Vec<ChatMessage> = load_session(&sessions_dir, &current_session);
@@ -1860,41 +2365,46 @@ async fn main() -> Result<()> {
     let _stream = start_capture(tx, config.audio.sample_rate, mic_gain.clone())?;
 
     let app_state = Arc::new(AppState {
-        config: config.clone(),
         key_state: key_state.clone(),
-        client: client.clone(),
         sessions_dir: sessions_dir.clone(),
-        current_session: current_session.clone(),
-        messages: messages.clone(),
-        effective_system: effective_system.clone(),
         mic_gain: mic_gain.clone(),
+        led: led.clone(),
     });
 
-    led_idle(&config.led);
+    if !config.groq.api_key.trim().is_empty() {
+        let alarm_ctx = AlarmContext {
+            store_path: config.alarm.store_path.clone(),
+            groq: config.groq.clone(),
+            client: client.clone(),
+            is_playing: is_playing.clone(),
+            stop_playback: key_state.stop_playback.clone(),
+            led: led.clone(),
+        };
+        tokio::spawn(alarm_watcher(alarm_ctx));
+        info!("Alarm watcher started ({} alarms loaded)", load_alarms(&config.alarm.store_path).len());
+    }
+
+    led.send(LedCommand::SetState(LedState::Idle));
 
     info!("Rimth listening... (session: {}, lang: {})", current_session, config.groq.language);
 
     loop {
         if key_state.muted.load(Ordering::SeqCst) {
-            led_muted(&config.led);
             while rx.try_recv().is_ok() {}
             tokio::time::sleep(Duration::from_millis(200)).await;
             continue;
         }
-        led_idle(&config.led);
 
-        // In conversation mode, skip VAD and go straight to recording
         if key_state.conversation_mode.load(Ordering::Relaxed) {
             info!("Conversation mode active, listening...");
-            led_listening(&config.led);
-            // Small delay to avoid picking up our own TTS tail
+            led.send(LedCommand::SetState(LedState::Listening));
             tokio::time::sleep(Duration::from_millis(300)).await;
             while rx.try_recv().is_ok() {}
         } else {
             if !wait_trigger(&mut rx, &config.audio, &is_playing, &key_state).await {
                 continue;
             }
-            led_listening(&config.led);
+            led.send(LedCommand::SetState(LedState::Listening));
         }
 
         if config.groq.api_key.trim().is_empty() {
@@ -1903,13 +2413,18 @@ async fn main() -> Result<()> {
         }
 
         info!("Recording...");
-        let wav = match record(&mut rx, &config.audio, &is_playing).await {
+        let wav_opt = match record(&mut rx, &config.audio, &is_playing, &key_state).await {
             Ok(w) => w,
             Err(e) => { error!("Record failed: {}", e); continue; }
+        };
+        let wav = match wav_opt {
+            Some(w) => w,
+            None => { led.send(LedCommand::SetState(LedState::Idle)); continue; }
         };
 
         if wav.len() < MIN_AUDIO_BYTES {
             info!("Recording too short ({} bytes), skipping", wav.len());
+            led.send(LedCommand::SetState(LedState::Idle));
             continue;
         }
 
@@ -1926,24 +2441,28 @@ async fn main() -> Result<()> {
                     _ => Prompt::Server,
                 };
                 play_prompt(p, &key_state.stop_playback).await;
+                led.send(LedCommand::SetState(LedState::Idle));
                 continue;
             }
         };
 
         info!("User: {}", user_text);
-        if user_text.trim().is_empty() { continue; }
+        if user_text.trim().is_empty() {
+            led.send(LedCommand::SetState(LedState::Idle));
+            continue;
+        }
         if is_hallucination(&user_text) {
             warn!("Detected Whisper hallucination, skipping: {}", user_text);
+            led.send(LedCommand::SetState(LedState::Idle));
             continue;
         }
 
         let lower = user_text.trim().to_lowercase();
 
-        // Direct voice commands for session management
         if lower == "diagnostics" || lower == "run diagnostics" {
             let ok = run_diagnostics(&config, &client).await;
             let reply = if ok { "Diagnostics passed." } else { "Diagnostics found problems." };
-            speak(&client, &config.groq, reply, &is_playing, &key_state.stop_playback, &mut rx, &config.led).await;
+            speak(&client, &config.groq, reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
             continue;
         }
 
@@ -1955,7 +2474,7 @@ async fn main() -> Result<()> {
             save_session(&sessions_dir, &current_session, &messages);
             let reply = format!("New session: {}", current_session);
             info!("{}", reply);
-            speak(&client, &config.groq, &reply, &is_playing, &key_state.stop_playback, &mut rx, &config.led).await;
+            speak(&client, &config.groq, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
             continue;
         }
 
@@ -1967,7 +2486,7 @@ async fn main() -> Result<()> {
                 let reply = if sessions.is_empty() { "No saved sessions".to_string() }
                 else { format!("Sessions: {}", sessions.join(", ")) };
                 info!("{}", reply);
-                speak(&client, &config.groq, &reply, &is_playing, &key_state.stop_playback, &mut rx, &config.led).await;
+                speak(&client, &config.groq, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
                 continue;
             }
             current_session = name;
@@ -1977,7 +2496,7 @@ async fn main() -> Result<()> {
             }
             let reply = format!("Resumed: {}", current_session);
             info!("{}", reply);
-            speak(&client, &config.groq, &reply, &is_playing, &key_state.stop_playback, &mut rx, &config.led).await;
+            speak(&client, &config.groq, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
             continue;
         }
 
@@ -1986,7 +2505,7 @@ async fn main() -> Result<()> {
             let reply = if sessions.is_empty() { "No sessions".to_string() }
             else { format!("Sessions: {}", sessions.join(", ")) };
             info!("{}", reply);
-            speak(&client, &config.groq, &reply, &is_playing, &key_state.stop_playback, &mut rx, &config.led).await;
+            speak(&client, &config.groq, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
             continue;
         }
 
@@ -1998,6 +2517,7 @@ async fn main() -> Result<()> {
         }
 
         info!("Thinking...");
+        led.send(LedCommand::StartThinking);
         let tools = tools_definition();
         let mut assistant_text = String::new();
 
@@ -2014,14 +2534,17 @@ async fn main() -> Result<()> {
                                 let result = execute_tool(
                                     &client,
                                     &config.audio,
-                                    &config.led,
                                     &config.alarm,
                                     &app_state,
                                     &tc.function.name,
                                     &tc.function.arguments,
                                 ).await;
                                 info!("Tool ({}): {}", tc.function.name, result);
-                                messages.push(ChatMessage::tool(tc.id.clone(), result));
+                                messages.push(ChatMessage::tool(
+                                    tc.id.clone(),
+                                    tc.function.name.clone(),
+                                    result,
+                                ));
                             }
                             continue;
                         }
@@ -2036,11 +2559,14 @@ async fn main() -> Result<()> {
                     else if msg.contains("401") || msg.contains("403") { Prompt::Auth }
                     else if msg.contains("400") || msg.contains("422") { Prompt::BadRequest }
                     else { Prompt::Server };
+                    led.send(LedCommand::StopThinking);
                     play_prompt(p, &key_state.stop_playback).await;
                     break;
                 }
             }
         }
+
+        led.send(LedCommand::StopThinking);
 
         if assistant_text.trim().is_empty() { continue; }
         info!("Assistant: {}", assistant_text);
@@ -2048,10 +2574,6 @@ async fn main() -> Result<()> {
         save_session(&sessions_dir, &current_session, &messages);
 
         info!("Synthesizing...");
-        speak(&client, &config.groq, &assistant_text, &is_playing, &key_state.stop_playback, &mut rx, &config.led).await;
-
-        // After speaking, if in conversation mode, keep the loop going
-        // without waiting for a volume trigger.
-        // The next iteration will check conversation_mode again.
+        speak(&client, &config.groq, &assistant_text, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
     }
 }
