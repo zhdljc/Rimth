@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender};
+use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 const STT_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
@@ -39,6 +40,9 @@ const TTS_CHUNK_CHARS: usize = 180;
 const MIN_AUDIO_BYTES: usize = 44 + 16000 * 2 * 1;
 const LED_COUNT: usize = 18;
 const LED_FPS_MS: u64 = 33;
+const LED_MAX_CONSECUTIVE_FAILURES: u32 = 10;
+
+type SharedGroq = Arc<RwLock<GroqConfig>>;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -108,21 +112,13 @@ struct KeysConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ProxyConfig {
-    url: String,
-}
+struct ProxyConfig { url: String }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SessionConfig {
-    persist_dir: String,
-    max_history: usize,
-}
+struct SessionConfig { persist_dir: String, max_history: usize }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DiagnosticsConfig {
-    run_on_startup: bool,
-    test_tts_on_startup: bool,
-}
+struct DiagnosticsConfig { run_on_startup: bool, test_tts_on_startup: bool }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LedConfig {
@@ -167,9 +163,7 @@ impl Default for LedConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct AlarmConfig {
-    store_path: String,
-}
+struct AlarmConfig { store_path: String }
 
 impl Default for Config {
     fn default() -> Self {
@@ -182,20 +176,13 @@ impl Default for Config {
                 tts_voice: "autumn".into(),
                 language: "en".into(),
                 system_prompt: "You are Rimth, a witty voice assistant on a speaker. Keep answers concise and conversational, with a light touch of humor. You can control volume, run terminal commands, fetch URLs, control the LED, set alarms, and switch models. Always reply in the user's language. Output plain prose only, no markdown, no tables, no emojis, because the reply will be spoken via TTS. If the user wants multiple alarms at different times, call set_alarm once per time.".into(),
-                stt_models_available: vec![
-                    "whisper-large-v3-turbo".into(),
-                    "whisper-large-v3".into(),
-                ],
+                stt_models_available: vec!["whisper-large-v3-turbo".into(), "whisper-large-v3".into()],
                 llm_models_available: vec![
-                    "openai/gpt-oss-20b".into(),
-                    "openai/gpt-oss-120b".into(),
-                    "qwen/qwen3.8-27b".into(),
-                    "groq/compound".into(),
-                    "groq/compound-mini".into(),
+                    "openai/gpt-oss-20b".into(), "openai/gpt-oss-120b".into(),
+                    "qwen/qwen3.8-27b".into(), "groq/compound".into(), "groq/compound-mini".into(),
                 ],
                 tts_models_available: vec![
-                    "canopylabs/orpheus-v1-english".into(),
-                    "canopylabs/orpheus-arabic-saudi".into(),
+                    "canopylabs/orpheus-v1-english".into(), "canopylabs/orpheus-arabic-saudi".into(),
                 ],
                 tts_voices_available: vec![
                     "troy".into(), "hannah".into(), "autumn".into(),
@@ -203,34 +190,23 @@ impl Default for Config {
                 ],
             },
             audio: AudioConfig {
-                trigger_threshold: 0.05,
-                silence_threshold: 0.005,
-                silence_duration_ms: 2000,
-                min_recording_ms: 1000,
-                sample_rate: 16000,
-                mixer_control: "mysoftvol".into(),
-                mic_mixer_control: "mysoftvol".into(),
-                max_volume: 80,
-                card_index: 0,
-                mic_gain: 1.0,
+                trigger_threshold: 0.05, silence_threshold: 0.005,
+                silence_duration_ms: 2000, min_recording_ms: 1000,
+                sample_rate: 16000, mixer_control: "mysoftvol".into(),
+                mic_mixer_control: "mysoftvol".into(), max_volume: 80,
+                card_index: 0, mic_gain: 1.0,
             },
             gpio: GpioConfig { mute_pin: 0, enabled: false },
             keys: KeysConfig {
-                enabled: true,
-                device: "/dev/input/event0".into(),
-                mute: 102,
-                volume_up: 139,
-                volume_down: 115,
-                play_pause: 114,
+                enabled: true, device: "/dev/input/event0".into(),
+                mute: 102, volume_up: 139, volume_down: 115, play_pause: 114,
                 volume_step: 5,
             },
             proxy: ProxyConfig { url: String::new() },
-            session: SessionConfig { persist_dir: String::new(), max_history: 50 },
+            session: SessionConfig { persist_dir: String::new(), max_history: 30 },
             diagnostics: DiagnosticsConfig { run_on_startup: true, test_tts_on_startup: false },
             led: LedConfig::default(),
-            alarm: AlarmConfig {
-                store_path: "/data/rimth/alarms.json".into(),
-            },
+            alarm: AlarmConfig { store_path: "/data/rimth/alarms.json".into() },
         }
     }
 }
@@ -291,10 +267,7 @@ struct ToolCall {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct FunctionCall {
-    name: String,
-    arguments: String,
-}
+struct FunctionCall { name: String, arguments: String }
 
 #[derive(Debug, Deserialize)]
 struct ModelsResponse { data: Vec<ModelInfo> }
@@ -304,30 +277,18 @@ struct ModelInfo { id: String }
 
 #[derive(Debug, Deserialize)]
 struct IpApiResponse {
-    #[allow(dead_code)]
-    status: String,
+    #[allow(dead_code)] status: String,
     country: Option<String>,
-    #[serde(rename = "countryCode")]
-    country_code: Option<String>,
-    #[serde(rename = "regionName")]
-    region_name: Option<String>,
-    city: Option<String>,
-    query: Option<String>,
-    timezone: Option<String>,
+    #[serde(rename = "countryCode")] country_code: Option<String>,
+    #[serde(rename = "regionName")] region_name: Option<String>,
+    city: Option<String>, query: Option<String>, timezone: Option<String>,
 }
 
-struct SttError {
-    status: u16,
-    message: String,
-}
+struct SttError { status: u16, message: String }
 
 enum Prompt { Auth, RateLimit, BadRequest, Server, Network }
 
-enum DiagnosticResult {
-    Ok(String),
-    Warn(String),
-    Fail(String),
-}
+enum DiagnosticResult { Ok(String), Warn(String), Fail(String) }
 
 impl DiagnosticResult {
     fn print(&self, label: &str) {
@@ -348,18 +309,10 @@ impl DiagnosticResult {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LedState {
-    Idle,
-    Listening,
-    Speaking,
-    Muted,
-    Alarm,
-}
+enum LedState { Idle, Listening, Speaking, Muted, Alarm }
 
 #[derive(Debug)]
 enum LedCommand {
-    SetAll(u32),
-    SetOne(usize, u32),
     SetState(LedState),
     StartThinking,
     StopThinking,
@@ -370,15 +323,11 @@ enum LedCommand {
 }
 
 #[derive(Clone)]
-struct LedHandle {
-    tx: Option<UnboundedSender<LedCommand>>,
-}
+struct LedHandle { tx: Option<UnboundedSender<LedCommand>> }
 
 impl LedHandle {
     fn send(&self, cmd: LedCommand) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(cmd);
-        }
+        if let Some(tx) = &self.tx { let _ = tx.send(cmd); }
     }
 }
 
@@ -407,11 +356,9 @@ fn step_toward(cur: u32, tgt: u32, step: u8) -> u32 {
     let tb = ((tgt >> 16) & 0xFF) as i32;
     let tg = ((tgt >> 8) & 0xFF) as i32;
     let tr = (tgt & 0xFF) as i32;
-
     let nb = if (tb - cb).abs() <= s { tb } else { cb + (tb - cb).signum() * s };
     let ng = if (tg - cg).abs() <= s { tg } else { cg + (tg - cg).signum() * s };
     let nr = if (tr - cr).abs() <= s { tr } else { cr + (tr - cr).signum() * s };
-
     ((nb as u32) << 16) | ((ng as u32) << 8) | (nr as u32)
 }
 
@@ -441,17 +388,22 @@ async fn led_worker(mut rx: UnboundedReceiver<LedCommand>, config: LedConfig) {
         return;
     }
 
+    if !PathBuf::from(&config.device).exists() {
+        warn!("LED device {} not found, disabling LED worker", config.device);
+        while rx.recv().await.is_some() {}
+        return;
+    }
+
     let mut target = [0u32; LED_COUNT];
     let mut current = [0u32; LED_COUNT];
     let mut brightness = config.brightness.min(100);
     let mut current_state = LedState::Idle;
     let mut thinking = false;
     let mut thinking_phase: u32 = 0;
+    let mut consecutive_failures: u32 = 0;
 
     let idle_bgr = state_to_color(LedState::Idle, &config);
-    for i in 0..LED_COUNT {
-        target[i] = idle_bgr;
-    }
+    for i in 0..LED_COUNT { target[i] = idle_bgr; }
 
     let mut interval = tokio::time::interval(Duration::from_millis(LED_FPS_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -461,16 +413,8 @@ async fn led_worker(mut rx: UnboundedReceiver<LedCommand>, config: LedConfig) {
     loop {
         tokio::select! {
             biased;
-
             cmd = rx.recv() => {
                 match cmd {
-                    Some(LedCommand::SetAll(bgr)) => {
-                        thinking = false;
-                        for i in 0..LED_COUNT { target[i] = bgr; }
-                    }
-                    Some(LedCommand::SetOne(idx, bgr)) => {
-                        if idx < LED_COUNT { target[idx] = bgr; }
-                    }
                     Some(LedCommand::SetState(s)) => {
                         thinking = false;
                         current_state = s;
@@ -486,9 +430,7 @@ async fn led_worker(mut rx: UnboundedReceiver<LedCommand>, config: LedConfig) {
                         let c = state_to_color(current_state, &config);
                         for i in 0..LED_COUNT { target[i] = c; }
                     }
-                    Some(LedCommand::SetBrightness(b)) => {
-                        brightness = b.min(100);
-                    }
+                    Some(LedCommand::SetBrightness(b)) => { brightness = b.min(100); }
                     Some(LedCommand::SetColorHex(hex)) => {
                         if let Some(bgr) = parse_rgb_hex_to_bgr(&hex) {
                             thinking = false;
@@ -509,27 +451,16 @@ async fn led_worker(mut rx: UnboundedReceiver<LedCommand>, config: LedConfig) {
                     None => break,
                 }
             }
-
             _ = interval.tick() => {
                 if thinking {
                     thinking_phase = thinking_phase.wrapping_add(1);
                     let head = ((thinking_phase / 6) % LED_COUNT as u32) as i32;
                     let think_bgr = parse_rgb_hex_to_bgr(&config.thinking_color).unwrap_or(0x8000FF);
-
                     for i in 0..LED_COUNT {
                         let dist = (i as i32 - head).rem_euclid(LED_COUNT as i32);
-                        let dist = if dist > (LED_COUNT as i32) / 2 {
-                            LED_COUNT as i32 - dist
-                        } else {
-                            dist
-                        };
+                        let dist = if dist > (LED_COUNT as i32) / 2 { LED_COUNT as i32 - dist } else { dist };
                         let intensity: u32 = match dist {
-                            0 => 255,
-                            1 => 170,
-                            2 => 100,
-                            3 => 55,
-                            4 => 30,
-                            _ => 12,
+                            0 => 255, 1 => 170, 2 => 100, 3 => 55, 4 => 30, _ => 12,
                         };
                         let factor = intensity * 100 / 255;
                         target[i] = apply_brightness(think_bgr, factor.min(100) as u8);
@@ -549,14 +480,19 @@ async fn led_worker(mut rx: UnboundedReceiver<LedCommand>, config: LedConfig) {
                 if changed || thinking {
                     let mut out = [0u32; LED_COUNT];
                     for i in 0..LED_COUNT {
-                        out[i] = if thinking {
-                            current[i]
-                        } else {
-                            apply_brightness(current[i], brightness)
-                        };
+                        out[i] = if thinking { current[i] } else { apply_brightness(current[i], brightness) };
                     }
-                    if let Err(e) = write_leds(&config.device, &out) {
-                        warn!("LED write failed: {}", e);
+                    match write_leds(&config.device, &out) {
+                        Ok(_) => { consecutive_failures = 0; }
+                        Err(e) => {
+                            consecutive_failures += 1;
+                            if consecutive_failures == 1 {
+                                warn!("LED write failed: {}", e);
+                            } else if consecutive_failures >= LED_MAX_CONSECUTIVE_FAILURES {
+                                warn!("LED disabled after {} consecutive failures", consecutive_failures);
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -590,6 +526,7 @@ struct AppState {
     sessions_dir: PathBuf,
     mic_gain: Arc<AtomicU32>,
     led: LedHandle,
+    groq: SharedGroq,
 }
 
 // ---------------------------------------------------------------------------
@@ -658,11 +595,7 @@ fn local_weekday() -> u8 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Alarm {
-    id: String,
-    time: String,
-    label: String,
-    repeat: String,
-    enabled: bool,
+    id: String, time: String, label: String, repeat: String, enabled: bool,
 }
 
 fn load_alarms(path: &str) -> Vec<Alarm> {
@@ -690,11 +623,8 @@ fn add_alarm(path: &str, time: &str, label: &str, repeat: &str) -> String {
         let candidate = format!("alarm_{}", n);
         if !alarms.iter().any(|a| a.id == candidate) {
             alarms.push(Alarm {
-                id: candidate.clone(),
-                time: time.to_string(),
-                label: label.to_string(),
-                repeat: repeat.to_string(),
-                enabled: true,
+                id: candidate.clone(), time: time.to_string(),
+                label: label.to_string(), repeat: repeat.to_string(), enabled: true,
             });
             save_alarms(path, &alarms);
             return format!("Alarm set for {} ({}, id {})", time, label, candidate);
@@ -797,18 +727,11 @@ fn split_text_for_tts(text: &str, max_chars: usize) -> Vec<String> {
 fn is_hallucination(text: &str) -> bool {
     let lower = text.to_lowercase();
     let patterns = [
-        "thanks for watching",
-        "thank you for watching",
-        "please subscribe",
-        "subscribe to",
-        "amara.org",
-        "subtitle",
-        "subtitles",
-        "mbc",
-        "kbs",
-        "jtbc",
-        "yoyo television",
-        "mingshi",
+        "thanks for watching", "thank you for watching",
+        "please subscribe", "subscribe to",
+        "amara.org", "subtitle", "subtitles",
+        "mbc", "kbs", "jtbc",
+        "yoyo television", "mingshi",
     ];
     patterns.iter().any(|p| lower.contains(p))
 }
@@ -834,11 +757,7 @@ fn choose_tts_for_language(lang: &str, config: &GroqConfig) -> (String, String) 
     match lang {
         "ar" => ("canopylabs/orpheus-arabic-saudi".into(), "default".into()),
         _ => {
-            let voice = if config.tts_voices_available.is_empty() {
-                "autumn".into()
-            } else {
-                config.tts_voice.clone()
-            };
+            let voice = if config.tts_voices_available.is_empty() { "autumn".into() } else { config.tts_voice.clone() };
             ("canopylabs/orpheus-v1-english".into(), voice)
         }
     }
@@ -847,30 +766,18 @@ fn choose_tts_for_language(lang: &str, config: &GroqConfig) -> (String, String) 
 fn language_name(code: &str) -> &'static str {
     match code {
         "zh" => "Chinese (Simplified)",
-        "en" => "English",
-        "ja" => "Japanese",
-        "ko" => "Korean",
-        "fr" => "French",
-        "de" => "German",
-        "es" => "Spanish",
-        "ru" => "Russian",
-        "ar" => "Arabic",
-        "pt" => "Portuguese",
-        "it" => "Italian",
-        "nl" => "Dutch",
-        "pl" => "Polish",
-        "tr" => "Turkish",
-        "hi" => "Hindi",
-        "th" => "Thai",
-        "vi" => "Vietnamese",
-        "id" => "Indonesian",
+        "en" => "English", "ja" => "Japanese", "ko" => "Korean",
+        "fr" => "French", "de" => "German", "es" => "Spanish",
+        "ru" => "Russian", "ar" => "Arabic", "pt" => "Portuguese",
+        "it" => "Italian", "nl" => "Dutch", "pl" => "Polish",
+        "tr" => "Turkish", "hi" => "Hindi", "th" => "Thai",
+        "vi" => "Vietnamese", "id" => "Indonesian",
         _ => "the user's language",
     }
 }
 
 fn build_system_prompt(user_prompt: &str, language: &str, config: &GroqConfig) -> String {
     let lang_name = language_name(language);
-
     let stt_list = config.stt_models_available.join(", ");
     let llm_list = config.llm_models_available.join(", ");
     let tts_list = config.tts_models_available.join(", ");
@@ -881,17 +788,17 @@ fn build_system_prompt(user_prompt: &str, language: &str, config: &GroqConfig) -
         Always reply in {}.\n\
         Detect the language of the user's latest message and respond in that language, even if it differs from the configured language above.\n\
         Output plain prose only. Do NOT use markdown, tables, bullet points, headings, emojis, or code blocks, because the reply will be spoken through a text-to-speech engine.\n\
-        Keep the entire reply under 500 characters when possible. If the user asks for something long, give a brief summary and offer to expand on a specific part.\n\n\
+        Keep the entire reply under 400 characters when possible.\n\n\
         Available models you can switch to using the switch_model tool:\n\
         STT models: {}\n\
         LLM models: {}\n\
         TTS models: {}\n\
         TTS voices: {}\n\n\
-        When the user asks to change a model, use the switch_model tool with the appropriate model_type (stt, llm, tts, voice) and model name.\n\
+        When the user asks to change a model, use the switch_model tool with the appropriate model_type (stt, llm, tts, voice) and model name. Do not just describe the change; actually call the tool.\n\
         When the user asks to set an alarm, use the set_alarm tool. If the user wants multiple alarms at different times, call set_alarm once per time.\n\
-        When the user asks to control the LED, use the led_control tool. You can set all LEDs to a color, set a single LED, adjust brightness, or switch to a preset state (idle, listening, speaking, muted).\n\
+        When the user asks to control the LED, use the led_control tool.\n\
         When the user wants to start a conversation mode (no wake word needed), use the conversation_mode tool with enabled=true. To exit, use enabled=false.\n\
-        When the user asks for a new session, use the session_control tool with action=new. To list sessions, use action=list. To switch, use action=switch and session_name.\n\
+        When the user asks for a new session, use the session_control tool with action=new.\n\
         When the user asks to mute or unmute the microphone, use the set_mute tool.",
         user_prompt, lang_name, stt_list, llm_list, tts_list, voice_list
     )
@@ -916,16 +823,8 @@ fn adjust_volume_relative(config: &AudioConfig, delta: i32) {
     info!("Volume adjusted to {}%", target);
 }
 
-fn start_key_listener(
-    config: KeysConfig,
-    audio: AudioConfig,
-    led: LedHandle,
-    state: Arc<KeyState>,
-) {
-    if !config.enabled {
-        info!("Key listener disabled");
-        return;
-    }
+fn start_key_listener(config: KeysConfig, audio: AudioConfig, led: LedHandle, state: Arc<KeyState>) {
+    if !config.enabled { info!("Key listener disabled"); return; }
     std::thread::spawn(move || {
         use std::io::Read;
         let mut file = match std::fs::File::open(&config.device) {
@@ -949,11 +848,7 @@ fn start_key_listener(
                 let now = !prev;
                 state.muted.store(now, Ordering::SeqCst);
                 info!("Mute toggled: mic {}", if now { "OFF" } else { "ON" });
-                if now {
-                    led.send(LedCommand::SetState(LedState::Muted));
-                } else {
-                    led.send(LedCommand::SetState(LedState::Idle));
-                }
+                led.send(LedCommand::SetState(if now { LedState::Muted } else { LedState::Idle }));
             } else if ev_value == 1 {
                 if ev_code == config.volume_up {
                     adjust_volume_relative(&audio, config.volume_step as i32);
@@ -1018,17 +913,12 @@ fn check_audio_devices(config: &AudioConfig) -> Vec<(&'static str, DiagnosticRes
 
 fn check_input_device(config: &KeysConfig) -> DiagnosticResult {
     if !config.enabled { return DiagnosticResult::Warn("disabled".into()); }
-    if PathBuf::from(&config.device).exists() {
-        DiagnosticResult::Ok(format!("{}", config.device))
-    } else {
-        DiagnosticResult::Fail(format!("{} not found", config.device))
-    }
+    if PathBuf::from(&config.device).exists() { DiagnosticResult::Ok(config.device.clone()) }
+    else { DiagnosticResult::Fail(format!("{} not found", config.device)) }
 }
 
 fn check_led(config: &LedConfig) -> DiagnosticResult {
-    if !config.enabled {
-        return DiagnosticResult::Warn("disabled in config".into());
-    }
+    if !config.enabled { return DiagnosticResult::Warn("disabled in config".into()); }
     if !PathBuf::from(&config.device).exists() {
         return DiagnosticResult::Fail(format!("{} not found", config.device));
     }
@@ -1142,17 +1032,11 @@ async fn run_diagnostics(config: &Config, client: &reqwest::Client) -> bool {
             Err(e) => DiagnosticResult::Fail(format!("cannot resolve: {}", e)),
         }),
     ];
-    for (label, r) in &system_items {
-        r.print(label);
-        count_result(r, &mut fails, &mut warns);
-    }
+    for (label, r) in &system_items { r.print(label); count_result(r, &mut fails, &mut warns); }
 
     println!();
     println!("[Audio]");
-    for (label, r) in check_audio_devices(&config.audio) {
-        r.print(label);
-        count_result(&r, &mut fails, &mut warns);
-    }
+    for (label, r) in check_audio_devices(&config.audio) { r.print(label); count_result(&r, &mut fails, &mut warns); }
 
     println!();
     println!("[Input]");
@@ -1170,24 +1054,16 @@ async fn run_diagnostics(config: &Config, client: &reqwest::Client) -> bool {
     println!("[Network]");
     if config.proxy.url.is_empty() {
         let r = DiagnosticResult::Warn("proxy not configured".into());
-        r.print("Proxy");
-        count_result(&r, &mut fails, &mut warns);
+        r.print("Proxy"); count_result(&r, &mut fails, &mut warns);
     } else {
-        let r = DiagnosticResult::Ok(format!("{}", config.proxy.url));
-        r.print("Proxy");
-        count_result(&r, &mut fails, &mut warns);
+        let r = DiagnosticResult::Ok(config.proxy.url.clone());
+        r.print("Proxy"); count_result(&r, &mut fails, &mut warns);
     }
-    for r in check_region(client).await {
-        r.print("Region");
-        count_result(&r, &mut fails, &mut warns);
-    }
+    for r in check_region(client).await { r.print("Region"); count_result(&r, &mut fails, &mut warns); }
 
     println!();
     println!("[Groq API]");
-    for r in check_groq_api(client, &config.groq).await {
-        r.print("Groq");
-        count_result(&r, &mut fails, &mut warns);
-    }
+    for r in check_groq_api(client, &config.groq).await { r.print("Groq"); count_result(&r, &mut fails, &mut warns); }
 
     println!();
     println!("============================================================");
@@ -1245,9 +1121,7 @@ async fn wait_trigger(
     while let Some(chunk) = rx.recv().await {
         if is_playing.load(Ordering::Relaxed) { continue; }
         if key_state.muted.load(Ordering::Relaxed) { continue; }
-        if key_state.conversation_mode.load(Ordering::Relaxed) {
-            return true;
-        }
+        if key_state.conversation_mode.load(Ordering::Relaxed) { return true; }
         if rms(&chunk) > config.trigger_threshold {
             info!("Volume trigger detected");
             return true;
@@ -1282,10 +1156,8 @@ async fn record(
     }
 
     let spec = WavSpec {
-        channels: 1,
-        sample_rate: config.sample_rate,
-        bits_per_sample: 16,
-        sample_format: HoundSampleFormat::Int,
+        channels: 1, sample_rate: config.sample_rate,
+        bits_per_sample: 16, sample_format: HoundSampleFormat::Int,
     };
     let mut cursor = Cursor::new(Vec::new());
     {
@@ -1312,13 +1184,10 @@ fn play_audio_bytes(bytes: Vec<u8>, stop_flag: &Arc<AtomicBool>) -> Result<()> {
     }
 
     let mut child = Command::new("aplay")
-        .arg("-q")
-        .arg("-")
+        .arg("-q").arg("-")
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("Failed to spawn aplay")?;
+        .stdout(Stdio::null()).stderr(Stdio::null())
+        .spawn().context("Failed to spawn aplay")?;
 
     let mut stdin = child.stdin.take().context("Failed to open aplay stdin")?;
     if let Err(e) = stdin.write_all(&bytes) {
@@ -1390,10 +1259,7 @@ async fn generate_prompt_sounds(client: &reqwest::Client, config: &GroqConfig) -
 
 async fn play_prompt(p: Prompt, stop_flag: &Arc<AtomicBool>) {
     let path = prompt_path(p);
-    if !path.exists() {
-        warn!("Missing prompt sound: {}", path.display());
-        return;
-    }
+    if !path.exists() { warn!("Missing prompt sound: {}", path.display()); return; }
     let stop = stop_flag.clone();
     let _ = tokio::task::spawn_blocking(move || {
         let bytes = match std::fs::read(&path) {
@@ -1460,7 +1326,7 @@ async fn chat(
         "model": config.llm_model,
         "messages": messages,
         "temperature": 0.7,
-        "max_tokens": 512
+        "max_tokens": 256
     });
     if let Some(t) = tools { body["tools"] = t; }
     let resp = client.post(CHAT_URL).bearer_auth(&config.api_key).json(&body).send().await?;
@@ -1505,10 +1371,9 @@ fn tools_definition() -> serde_json::Value {
                 "model_name": {"type": "string"}
             }, "required": ["model_type", "model_name"]}}},
         {"type": "function", "function": {"name": "set_alarm",
-            "description": "Set an alarm on the speaker. If the user wants multiple alarms at different times, call this tool once per time.",
+            "description": "Set an alarm on the speaker.",
             "parameters": {"type": "object", "properties": {
-                "time": {"type": "string", "description": "HH:MM format"},
-                "label": {"type": "string"},
+                "time": {"type": "string"}, "label": {"type": "string"},
                 "repeat": {"type": "string", "enum": ["once", "daily", "weekdays"]}
             }, "required": ["time"]}}},
         {"type": "function", "function": {"name": "list_alarms",
@@ -1518,37 +1383,31 @@ fn tools_definition() -> serde_json::Value {
             "description": "Delete an alarm by its ID.",
             "parameters": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}}},
         {"type": "function", "function": {"name": "led_control",
-            "description": "Control the RGB LED ring on the speaker. Set all LEDs to a color, set a single LED, adjust brightness, or switch to a preset state.",
+            "description": "Control the RGB LED ring on the speaker.",
             "parameters": {"type": "object", "properties": {
-                "color": {"type": "string", "description": "Hex color RRGGBB (e.g. FF00AA). If provided, all LEDs or the specified index will be set to this color."},
-                "index": {"type": "integer", "description": "LED index 0-17 to set a single LED. Omit for all LEDs."},
-                "brightness": {"type": "integer", "description": "Global brightness 0-100. Applied on top of the current color."},
-                "state": {"type": "string", "enum": ["idle", "listening", "speaking", "muted", "off"], "description": "Preset state to switch to. Overrides color if both are provided."}
+                "color": {"type": "string"},
+                "index": {"type": "integer"},
+                "brightness": {"type": "integer"},
+                "state": {"type": "string", "enum": ["idle", "listening", "speaking", "muted", "off"]}
             }}}},
         {"type": "function", "function": {"name": "conversation_mode",
-            "description": "Enable or disable conversation mode. When enabled, the assistant keeps listening without waiting for a volume trigger.",
-            "parameters": {"type": "object", "properties": {
-                "enabled": {"type": "boolean"}
-            }, "required": ["enabled"]}}},
+            "description": "Enable or disable conversation mode.",
+            "parameters": {"type": "object", "properties": {"enabled": {"type": "boolean"}}, "required": ["enabled"]}}},
         {"type": "function", "function": {"name": "session_control",
-            "description": "Manage sessions: create new, list, or switch.",
+            "description": "Manage sessions.",
             "parameters": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["new", "list", "switch"]},
                 "session_name": {"type": "string"}
             }, "required": ["action"]}}},
         {"type": "function", "function": {"name": "set_mic_gain",
             "description": "Set the microphone gain multiplier (0.1 - 10.0).",
-            "parameters": {"type": "object", "properties": {
-                "gain": {"type": "number", "description": "Gain multiplier"}
-            }, "required": ["gain"]}}},
+            "parameters": {"type": "object", "properties": {"gain": {"type": "number"}}, "required": ["gain"]}}},
         {"type": "function", "function": {"name": "get_mic_gain",
             "description": "Get the current microphone gain.",
             "parameters": {"type": "object", "properties": {}, "required": []}}},
         {"type": "function", "function": {"name": "set_mute",
-            "description": "Toggle or set the microphone mute state. When muted, the microphone does not receive input and any in-progress recording is cancelled.",
-            "parameters": {"type": "object", "properties": {
-                "muted": {"type": "boolean", "description": "true to mute, false to unmute"}
-            }, "required": ["muted"]}}}
+            "description": "Toggle or set the microphone mute state.",
+            "parameters": {"type": "object", "properties": {"muted": {"type": "boolean"}}, "required": ["muted"]}}}
     ])
 }
 
@@ -1623,13 +1482,9 @@ async fn execute_tool(
                     if !stdout.is_empty() { result.push_str(&stdout); }
                     if !stderr.is_empty() {
                         if !result.is_empty() { result.push('\n'); }
-                        result.push_str("STDERR: ");
-                        result.push_str(&stderr);
+                        result.push_str("STDERR: "); result.push_str(&stderr);
                     }
-                    if result.len() > 2000 {
-                        result.truncate(2000);
-                        result.push_str("... (truncated)");
-                    }
+                    if result.len() > 2000 { result.truncate(2000); result.push_str("... (truncated)"); }
                     result
                 }
                 Err(e) => format!("Failed: {}", e),
@@ -1647,12 +1502,8 @@ async fn execute_tool(
                     let status = resp.status().as_u16();
                     let text = resp.text().await.unwrap_or_default();
                     let mut result = format!("Status: {}\n", status);
-                    if text.len() > 2000 {
-                        result.push_str(&text[..2000]);
-                        result.push_str("... (truncated)");
-                    } else {
-                        result.push_str(&text);
-                    }
+                    if text.len() > 2000 { result.push_str(&text[..2000]); result.push_str("... (truncated)"); }
+                    else { result.push_str(&text); }
                     result
                 }
                 Err(e) => format!("Failed: {}", e),
@@ -1666,8 +1517,17 @@ async fn execute_tool(
             let model_type = parsed["model_type"].as_str().unwrap_or("");
             let model_name = parsed["model_name"].as_str().unwrap_or("");
             if model_name.is_empty() { return "No model name".into(); }
-            info!("Switch {} to {}", model_type, model_name);
-            format!("Switched {} model to {}", model_type, model_name)
+
+            let mut cfg = state.groq.write().await;
+            match model_type {
+                "stt" => { cfg.stt_model = model_name.into(); }
+                "llm" => { cfg.llm_model = model_name.into(); }
+                "tts" => { cfg.tts_model = model_name.into(); }
+                "voice" => { cfg.tts_voice = model_name.into(); }
+                _ => return format!("Unknown model_type: {}", model_type),
+            }
+            info!("Switched {} to {}", model_type, model_name);
+            format!("Switched {} to {}", model_type, model_name)
         }
         "set_alarm" => {
             let parsed: serde_json::Value = match serde_json::from_str(args) {
@@ -1690,20 +1550,14 @@ async fn execute_tool(
             let parsed: serde_json::Value = match serde_json::from_str(args) {
                 Ok(v) => v, Err(e) => return format!("Parse failed: {}", e),
             };
-
             let mut actions: Vec<String> = Vec::new();
-
             if let Some(state_str) = parsed["state"].as_str() {
                 let led_state = match state_str {
                     "idle" => Some(LedState::Idle),
                     "listening" => Some(LedState::Listening),
                     "speaking" => Some(LedState::Speaking),
                     "muted" => Some(LedState::Muted),
-                    "off" => {
-                        state.led.send(LedCommand::Off);
-                        actions.push("LED off".into());
-                        None
-                    }
+                    "off" => { state.led.send(LedCommand::Off); actions.push("LED off".into()); None }
                     _ => None,
                 };
                 if let Some(s) = led_state {
@@ -1711,7 +1565,6 @@ async fn execute_tool(
                     actions.push(format!("state {}", state_str));
                 }
             }
-
             if let Some(color) = parsed["color"].as_str() {
                 if parse_rgb_hex_to_bgr(color).is_some() {
                     if let Some(idx) = parsed["index"].as_i64() {
@@ -1728,18 +1581,13 @@ async fn execute_tool(
                     }
                 }
             }
-
             if let Some(b) = parsed["brightness"].as_u64() {
                 let b = b.min(100) as u8;
                 state.led.send(LedCommand::SetBrightness(b));
                 actions.push(format!("brightness {}", b));
             }
-
-            if actions.is_empty() {
-                "No LED action specified".into()
-            } else {
-                format!("LED: {}", actions.join(", "))
-            }
+            if actions.is_empty() { "No LED action specified".into() }
+            else { format!("LED: {}", actions.join(", ")) }
         }
         "conversation_mode" => {
             let parsed: serde_json::Value = match serde_json::from_str(args) {
@@ -1747,11 +1595,8 @@ async fn execute_tool(
             };
             let enabled = parsed["enabled"].as_bool().unwrap_or(false);
             state.key_state.conversation_mode.store(enabled, Ordering::SeqCst);
-            if enabled {
-                "Conversation mode enabled. I will keep listening.".into()
-            } else {
-                "Conversation mode disabled.".into()
-            }
+            if enabled { "Conversation mode enabled. I will keep listening.".into() }
+            else { "Conversation mode disabled.".into() }
         }
         "session_control" => {
             let parsed: serde_json::Value = match serde_json::from_str(args) {
@@ -1759,10 +1604,7 @@ async fn execute_tool(
             };
             let action = parsed["action"].as_str().unwrap_or("list");
             match action {
-                "new" => {
-                    let name = format!("session_{}", rand::random::<u16>());
-                    format!("New session created: {}", name)
-                }
+                "new" => format!("New session created: session_{}", rand::random::<u16>()),
                 "list" => {
                     let sessions = list_sessions(&state.sessions_dir);
                     if sessions.is_empty() { "No sessions".into() }
@@ -1815,13 +1657,48 @@ fn session_file_path(dir: &PathBuf, name: &str) -> PathBuf {
     dir.join(format!("{}.json", name))
 }
 
+/// Remove historical tool-call/tool-result messages that could violate
+/// Groq's Harmony encoding rules (missing `name`, orphaned tool_call_id, etc.).
+/// Keeps only system, user, and text-only assistant messages.
+fn sanitize_session(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let mut out: Vec<ChatMessage> = Vec::new();
+    for msg in messages {
+        match msg.role.as_str() {
+            "system" => {
+                if msg.content.is_some() {
+                    out.push(ChatMessage::system(msg.content.unwrap_or_default()));
+                }
+            }
+            "user" => {
+                if msg.content.is_some() {
+                    out.push(ChatMessage::user(msg.content.unwrap_or_default()));
+                }
+            }
+            "assistant" => {
+                // Only keep assistant messages that have text and no tool calls.
+                if msg.tool_calls.is_none() {
+                    if let Some(c) = msg.content {
+                        if !c.trim().is_empty() {
+                            out.push(ChatMessage::assistant(Some(c), None));
+                        }
+                    }
+                }
+            }
+            // Drop all tool result messages.
+            _ => {}
+        }
+    }
+    out
+}
+
 fn load_session(dir: &PathBuf, name: &str) -> Vec<ChatMessage> {
     let path = session_file_path(dir, name);
     if path.exists() {
         if let Ok(content) = std::fs::read_to_string(&path) {
             if let Ok(messages) = serde_json::from_str::<Vec<ChatMessage>>(&content) {
-                info!("Loaded session '{}' with {} messages", name, messages.len());
-                return messages;
+                let cleaned = sanitize_session(messages);
+                info!("Loaded session '{}' with {} messages (after sanitize)", name, cleaned.len());
+                return cleaned;
             }
         }
     }
@@ -1851,7 +1728,7 @@ fn list_sessions(dir: &PathBuf) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Speak: chunked TTS with LED feedback
+// Speak
 // ---------------------------------------------------------------------------
 
 async fn speak(
@@ -1886,13 +1763,15 @@ async fn speak(
             info!("Playback cancelled before segment {}", i + 1);
             break;
         }
-
-        match tts(client, config, seg, &tts_voice).await {
+        // Clone config for each call so shared lock is not held across await.
+        let cfg_snapshot = {
+            let g = config.clone();
+            g
+        };
+        match tts(client, &cfg_snapshot, seg, &tts_voice).await {
             Ok(audio) => {
                 let stop = stop_playback.clone();
-                if let Err(e) =
-                    tokio::task::spawn_blocking(move || play_audio_bytes(audio, &stop)).await
-                {
+                if let Err(e) = tokio::task::spawn_blocking(move || play_audio_bytes(audio, &stop)).await {
                     error!("Playback failed: {}", e);
                     break;
                 }
@@ -1917,7 +1796,7 @@ async fn speak(
 
 struct AlarmContext {
     store_path: String,
-    groq: GroqConfig,
+    groq: SharedGroq,
     client: reqwest::Client,
     is_playing: Arc<AtomicBool>,
     stop_playback: Arc<AtomicBool>,
@@ -1930,10 +1809,7 @@ async fn alarm_watcher(ctx: AlarmContext) {
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
 
-        let now_hm = match local_time_hm() {
-            Some(t) => t,
-            None => continue,
-        };
+        let now_hm = match local_time_hm() { Some(t) => t, None => continue };
         let today = local_date().unwrap_or_default();
         let weekday = local_weekday();
         let fire_key_suffix = format!("{} {}", today, now_hm);
@@ -1945,46 +1821,34 @@ async fn alarm_watcher(ctx: AlarmContext) {
         for alarm in alarms.iter_mut() {
             if !alarm.enabled { continue; }
             if alarm.time != now_hm { continue; }
-
             let key = (alarm.id.clone(), fire_key_suffix.clone());
             if last_fired.contains(&key) { continue; }
-
             let should_fire = match alarm.repeat.as_str() {
                 "weekdays" => (1..=5).contains(&weekday),
                 _ => true,
             };
             if !should_fire { continue; }
-
             last_fired.push(key);
             to_fire.push((alarm.id.clone(), alarm.time.clone(), alarm.label.clone()));
-
-            if alarm.repeat == "once" {
-                alarm.enabled = false;
-                dirty = true;
-            }
+            if alarm.repeat == "once" { alarm.enabled = false; dirty = true; }
         }
 
-        if dirty {
-            save_alarms(&ctx.store_path, &alarms);
-        }
+        if dirty { save_alarms(&ctx.store_path, &alarms); }
 
         for (id, time, label) in to_fire {
-            let msg = if label.trim().is_empty() {
-                format!("Alarm at {}", time)
-            } else {
-                format!("Alarm at {}: {}", time, label)
-            };
+            let msg = if label.trim().is_empty() { format!("Alarm at {}", time) }
+            else { format!("Alarm at {}: {}", time, label) };
             info!("Alarm firing ({}): {}", id, msg);
 
             ctx.led.send(LedCommand::SetState(LedState::Alarm));
-            match tts(&ctx.client, &ctx.groq, &msg, &ctx.groq.tts_voice).await {
+            let cfg = ctx.groq.read().await.clone();
+            match tts(&ctx.client, &cfg, &msg, &cfg.tts_voice).await {
                 Ok(audio) => {
                     ctx.is_playing.store(true, Ordering::SeqCst);
                     let stop = ctx.stop_playback.clone();
                     let _ = tokio::task::spawn_blocking(move || {
                         let _ = play_audio_bytes(audio, &stop);
-                    })
-                        .await;
+                    }).await;
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     ctx.is_playing.store(false, Ordering::SeqCst);
                     ctx.led.send(LedCommand::SetState(LedState::Idle));
@@ -2049,12 +1913,7 @@ fn test_speaker() -> Result<()> {
             (2.0 * std::f32::consts::PI * freq * t).sin() * 0.3
         })
         .collect();
-    let spec = WavSpec {
-        channels: 1,
-        sample_rate,
-        bits_per_sample: 16,
-        sample_format: HoundSampleFormat::Int,
-    };
+    let spec = WavSpec { channels: 1, sample_rate, bits_per_sample: 16, sample_format: HoundSampleFormat::Int };
     let mut cursor = Cursor::new(Vec::new());
     {
         let mut w = WavWriter::new(&mut cursor, spec)?;
@@ -2094,8 +1953,6 @@ fn test_keys(config: &KeysConfig) -> Result<()> {
 
     println!();
     println!("[Keys Test] Listening on {} for 15 seconds", config.device);
-    println!("  Press buttons to see their codes. Press Ctrl+C to exit early.");
-
     use std::io::Read;
     use std::os::unix::io::AsRawFd;
     let mut file = std::fs::File::open(&config.device)?;
@@ -2103,7 +1960,6 @@ fn test_keys(config: &KeysConfig) -> Result<()> {
         let flags = libc::fcntl(file.as_raw_fd(), libc::F_GETFL, 0);
         libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
-
     let start = std::time::Instant::now();
     let mut buf = [0u8; 16];
     while start.elapsed() < Duration::from_secs(15) {
@@ -2142,9 +1998,7 @@ async fn test_network(client: &reqwest::Client, proxy_url: &str) -> Result<()> {
                              info.city.as_deref().unwrap_or("?"),
                              info.country.as_deref().unwrap_or("?"));
                 }
-            } else {
-                println!("  [WARN] HTTP {}", status);
-            }
+            } else { println!("  [WARN] HTTP {}", status); }
         }
         Err(e) => println!("  [FAIL] {}", e),
     }
@@ -2161,9 +2015,7 @@ async fn test_groq(client: &reqwest::Client, config: &GroqConfig) -> Result<()> 
             if let Ok(models) = r.json::<ModelsResponse>().await {
                 let ids: Vec<String> = models.data.iter().map(|m| m.id.clone()).collect();
                 for (label, id) in [
-                    ("STT", &config.stt_model),
-                    ("LLM", &config.llm_model),
-                    ("TTS", &config.tts_model),
+                    ("STT", &config.stt_model), ("LLM", &config.llm_model), ("TTS", &config.tts_model),
                 ] {
                     if ids.iter().any(|i| i == id) { println!("  [OK] {} model: {}", label, id); }
                     else { println!("  [WARN] {} model not available: {}", label, id); }
@@ -2184,32 +2036,25 @@ async fn test_groq(client: &reqwest::Client, config: &GroqConfig) -> Result<()> 
 fn test_led(config: &LedConfig) -> Result<()> {
     println!();
     println!("[LED Test]");
-    if !config.enabled {
-        println!("  [SKIP] LED disabled in config");
+    if !config.enabled { println!("  [SKIP] LED disabled in config"); return Ok(()); }
+    println!("  Device: {}", config.device);
+    if !PathBuf::from(&config.device).exists() {
+        println!("  [FAIL] Device not found");
         return Ok(());
     }
-    println!("  Device: {}", config.device);
-
     let colors_sequence: [(u32, &str); 4] = [
-        (0x0000FF, "red"),
-        (0x00FF00, "green"),
-        (0xFF0000, "blue"),
-        (0xFFFFFF, "white"),
+        (0x0000FF, "red"), (0x00FF00, "green"),
+        (0xFF0000, "blue"), (0xFFFFFF, "white"),
     ];
-
     for (bgr, name) in colors_sequence {
         let arr = [bgr; LED_COUNT];
         println!("  Setting all LEDs to {}", name);
-        match write_leds(&config.device, &arr) {
-            Ok(_) => {}
-            Err(e) => {
-                println!("  [FAIL] {}", e);
-                return Ok(());
-            }
+        if let Err(e) = write_leds(&config.device, &arr) {
+            println!("  [FAIL] {}", e);
+            return Ok(());
         }
         std::thread::sleep(Duration::from_millis(700));
     }
-
     let off = [0u32; LED_COUNT];
     let _ = write_leds(&config.device, &off);
     println!("  [OK] LED test done");
@@ -2220,10 +2065,7 @@ fn test_alarms(store_path: &str) -> Result<()> {
     println!();
     println!("[Alarms Test]");
     println!("  Store path: {}", store_path);
-    println!("  Current list:");
-    for line in list_alarms_text(store_path).split("; ") {
-        println!("    {}", line);
-    }
+    for line in list_alarms_text(store_path).split("; ") { println!("    {}", line); }
     Ok(())
 }
 
@@ -2316,6 +2158,7 @@ async fn main() -> Result<()> {
         return run_test_command(sub, &config, &client, mic_gain).await;
     }
 
+    let groq: SharedGroq = Arc::new(RwLock::new(config.groq.clone()));
     let led = spawn_led_worker(config.led.clone());
 
     let key_state = Arc::new(KeyState {
@@ -2324,21 +2167,19 @@ async fn main() -> Result<()> {
         conversation_mode: Arc::new(AtomicBool::new(false)),
     });
 
-    start_key_listener(
-        config.keys.clone(),
-        config.audio.clone(),
-        led.clone(),
-        key_state.clone(),
-    );
+    start_key_listener(config.keys.clone(), config.audio.clone(), led.clone(), key_state.clone());
 
     if config.diagnostics.run_on_startup || args.iter().any(|a| a == "--diagnostics") {
         let ok = run_diagnostics(&config, &client).await;
         if !ok { warn!("Diagnostics reported failures"); }
     }
 
-    if !config.groq.api_key.trim().is_empty() {
-        if let Err(e) = generate_prompt_sounds(&client, &config.groq).await {
-            warn!("Prompt sound generation failed: {}", e);
+    {
+        let cfg = groq.read().await;
+        if !cfg.api_key.trim().is_empty() {
+            if let Err(e) = generate_prompt_sounds(&client, &cfg).await {
+                warn!("Prompt sound generation failed: {}", e);
+            }
         }
     }
 
@@ -2346,11 +2187,10 @@ async fn main() -> Result<()> {
     else { PathBuf::from(&config.session.persist_dir) };
     std::fs::create_dir_all(&sessions_dir)?;
 
-    let effective_system = build_system_prompt(
-        &config.groq.system_prompt,
-        &config.groq.language,
-        &config.groq,
-    );
+    let effective_system = {
+        let cfg = groq.read().await;
+        build_system_prompt(&cfg.system_prompt, &cfg.language, &cfg)
+    };
 
     let mut current_session = "default".to_string();
     let mut messages: Vec<ChatMessage> = load_session(&sessions_dir, &current_session);
@@ -2369,24 +2209,29 @@ async fn main() -> Result<()> {
         sessions_dir: sessions_dir.clone(),
         mic_gain: mic_gain.clone(),
         led: led.clone(),
+        groq: groq.clone(),
     });
 
-    if !config.groq.api_key.trim().is_empty() {
-        let alarm_ctx = AlarmContext {
-            store_path: config.alarm.store_path.clone(),
-            groq: config.groq.clone(),
-            client: client.clone(),
-            is_playing: is_playing.clone(),
-            stop_playback: key_state.stop_playback.clone(),
-            led: led.clone(),
-        };
-        tokio::spawn(alarm_watcher(alarm_ctx));
-        info!("Alarm watcher started ({} alarms loaded)", load_alarms(&config.alarm.store_path).len());
+    {
+        let cfg = groq.read().await;
+        if !cfg.api_key.trim().is_empty() {
+            let alarm_ctx = AlarmContext {
+                store_path: config.alarm.store_path.clone(),
+                groq: groq.clone(),
+                client: client.clone(),
+                is_playing: is_playing.clone(),
+                stop_playback: key_state.stop_playback.clone(),
+                led: led.clone(),
+            };
+            tokio::spawn(alarm_watcher(alarm_ctx));
+            info!("Alarm watcher started ({} alarms loaded)", load_alarms(&config.alarm.store_path).len());
+        }
     }
 
     led.send(LedCommand::SetState(LedState::Idle));
 
-    info!("Rimth listening... (session: {}, lang: {})", current_session, config.groq.language);
+    let lang_now = groq.read().await.language.clone();
+    info!("Rimth listening... (session: {}, lang: {})", current_session, lang_now);
 
     loop {
         if key_state.muted.load(Ordering::SeqCst) {
@@ -2401,13 +2246,12 @@ async fn main() -> Result<()> {
             tokio::time::sleep(Duration::from_millis(300)).await;
             while rx.try_recv().is_ok() {}
         } else {
-            if !wait_trigger(&mut rx, &config.audio, &is_playing, &key_state).await {
-                continue;
-            }
+            if !wait_trigger(&mut rx, &config.audio, &is_playing, &key_state).await { continue; }
             led.send(LedCommand::SetState(LedState::Listening));
         }
 
-        if config.groq.api_key.trim().is_empty() {
+        let api_key_now = groq.read().await.api_key.clone();
+        if api_key_now.trim().is_empty() {
             warn!("API key not set, skipping");
             continue;
         }
@@ -2429,28 +2273,28 @@ async fn main() -> Result<()> {
         }
 
         info!("Transcribing...");
-        let user_text = match stt(&client, &config.groq, wav).await {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("STT {}: {}", e.status, e.message);
-                let p = match e.status {
-                    401 | 403 => Prompt::Auth,
-                    429 | 413 => Prompt::RateLimit,
-                    400 | 422 => Prompt::BadRequest,
-                    500 | 502 | 503 => Prompt::Server,
-                    _ => Prompt::Server,
-                };
-                play_prompt(p, &key_state.stop_playback).await;
-                led.send(LedCommand::SetState(LedState::Idle));
-                continue;
+        let user_text = {
+            let cfg = groq.read().await.clone();
+            match stt(&client, &cfg, wav).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!("STT {}: {}", e.status, e.message);
+                    let p = match e.status {
+                        401 | 403 => Prompt::Auth,
+                        429 | 413 => Prompt::RateLimit,
+                        400 | 422 => Prompt::BadRequest,
+                        500 | 502 | 503 => Prompt::Server,
+                        _ => Prompt::Server,
+                    };
+                    play_prompt(p, &key_state.stop_playback).await;
+                    led.send(LedCommand::SetState(LedState::Idle));
+                    continue;
+                }
             }
         };
 
         info!("User: {}", user_text);
-        if user_text.trim().is_empty() {
-            led.send(LedCommand::SetState(LedState::Idle));
-            continue;
-        }
+        if user_text.trim().is_empty() { led.send(LedCommand::SetState(LedState::Idle)); continue; }
         if is_hallucination(&user_text) {
             warn!("Detected Whisper hallucination, skipping: {}", user_text);
             led.send(LedCommand::SetState(LedState::Idle));
@@ -2462,7 +2306,8 @@ async fn main() -> Result<()> {
         if lower == "diagnostics" || lower == "run diagnostics" {
             let ok = run_diagnostics(&config, &client).await;
             let reply = if ok { "Diagnostics passed." } else { "Diagnostics found problems." };
-            speak(&client, &config.groq, reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
+            let cfg = groq.read().await.clone();
+            speak(&client, &cfg, reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
             continue;
         }
 
@@ -2474,7 +2319,8 @@ async fn main() -> Result<()> {
             save_session(&sessions_dir, &current_session, &messages);
             let reply = format!("New session: {}", current_session);
             info!("{}", reply);
-            speak(&client, &config.groq, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
+            let cfg = groq.read().await.clone();
+            speak(&client, &cfg, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
             continue;
         }
 
@@ -2486,7 +2332,8 @@ async fn main() -> Result<()> {
                 let reply = if sessions.is_empty() { "No saved sessions".to_string() }
                 else { format!("Sessions: {}", sessions.join(", ")) };
                 info!("{}", reply);
-                speak(&client, &config.groq, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
+                let cfg = groq.read().await.clone();
+                speak(&client, &cfg, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
                 continue;
             }
             current_session = name;
@@ -2496,7 +2343,8 @@ async fn main() -> Result<()> {
             }
             let reply = format!("Resumed: {}", current_session);
             info!("{}", reply);
-            speak(&client, &config.groq, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
+            let cfg = groq.read().await.clone();
+            speak(&client, &cfg, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
             continue;
         }
 
@@ -2505,7 +2353,8 @@ async fn main() -> Result<()> {
             let reply = if sessions.is_empty() { "No sessions".to_string() }
             else { format!("Sessions: {}", sessions.join(", ")) };
             info!("{}", reply);
-            speak(&client, &config.groq, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
+            let cfg = groq.read().await.clone();
+            speak(&client, &cfg, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
             continue;
         }
 
@@ -2522,7 +2371,8 @@ async fn main() -> Result<()> {
         let mut assistant_text = String::new();
 
         for _ in 0..5 {
-            match chat(&client, &config.groq, &messages, Some(tools.clone())).await {
+            let cfg = groq.read().await.clone();
+            match chat(&client, &cfg, &messages, Some(tools.clone())).await {
                 Ok(response) => {
                     if let Some(tool_calls) = &response.tool_calls {
                         if !tool_calls.is_empty() {
@@ -2532,18 +2382,12 @@ async fn main() -> Result<()> {
                             ));
                             for tc in tool_calls {
                                 let result = execute_tool(
-                                    &client,
-                                    &config.audio,
-                                    &config.alarm,
-                                    &app_state,
-                                    &tc.function.name,
-                                    &tc.function.arguments,
+                                    &client, &config.audio, &config.alarm, &app_state,
+                                    &tc.function.name, &tc.function.arguments,
                                 ).await;
                                 info!("Tool ({}): {}", tc.function.name, result);
                                 messages.push(ChatMessage::tool(
-                                    tc.id.clone(),
-                                    tc.function.name.clone(),
-                                    result,
+                                    tc.id.clone(), tc.function.name.clone(), result,
                                 ));
                             }
                             continue;
@@ -2561,6 +2405,11 @@ async fn main() -> Result<()> {
                     else { Prompt::Server };
                     led.send(LedCommand::StopThinking);
                     play_prompt(p, &key_state.stop_playback).await;
+                    // On 400 due to Harmony encoding, clear history to recover.
+                    if msg.contains("Tools should have a name") {
+                        warn!("History corrupted (harmony encoding). Trimming tool messages.");
+                        messages = sanitize_session(messages);
+                    }
                     break;
                 }
             }
@@ -2574,6 +2423,7 @@ async fn main() -> Result<()> {
         save_session(&sessions_dir, &current_session, &messages);
 
         info!("Synthesizing...");
-        speak(&client, &config.groq, &assistant_text, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
+        let cfg = groq.read().await.clone();
+        speak(&client, &cfg, &assistant_text, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
     }
 }

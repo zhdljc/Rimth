@@ -31,12 +31,13 @@ tts_model = "canopylabs/orpheus-v1-english"
 # Options: troy, hannah, autumn, diana, austin, daniel
 tts_voice = "autumn"
 
-# Language for STT (ISO 639-1)
-# Examples: zh, en, ja, ko, fr, de, es, ru, ar
-language = "zh"
+# Language for STT (ISO 639-1). Used as a hint to Whisper.
+# The AI will reply in the user's language regardless of this setting.
+# Examples: en, zh, ja, ko, fr, de, es, ru, ar
+language = "en"
 
 # System prompt for the LLM
-system_prompt = "You are Rimth, a witty voice assistant on a speaker. Keep answers concise and conversational, with a light touch of humor. You can control volume, run terminal commands, fetch URLs, control the LED, set alarms, and switch models. Always reply in the user's language. Output plain prose only, no markdown, no tables, no emojis, because the reply will be spoken via TTS."
+system_prompt = "You are Rimth, a witty voice assistant on a speaker. Keep answers concise and conversational, with a light touch of humor. You can control volume, run terminal commands, fetch URLs, control the LED, set alarms, and switch models. Always reply in the user's language. Output plain prose only, no markdown, no tables, no emojis, because the reply will be spoken via TTS. If the user wants multiple alarms at different times, call set_alarm once per time."
 
 # Models the AI can switch to via the switch_model tool.
 # These lists are shown to the AI so it knows what is available.
@@ -163,7 +164,8 @@ url = ""
 persist_dir = ""
 
 # Maximum number of messages kept in history (excluding system prompt)
-max_history = 50
+# Lower values reduce token usage and avoid TPM rate limits.
+max_history = 30
 
 
 # ------------------------------------------------------------
@@ -180,23 +182,31 @@ test_tts_on_startup = false
 # ------------------------------------------------------------
 # RGB LED control
 # ------------------------------------------------------------
+# LX06 uses the AW20054 LED driver. The user-space interface is exposed
+# at /sys/devices/i2c-0/0-003a/led_rgb. The driver expects writes in the
+# format "IDX 0xBBGGRR\n", one line per LED (indices 0..17).
 [led]
-# Enable LED control (uses sysfs or i2cset)
+# Enable LED control
 enabled = true
 
-# Path to the LED sysfs device
-# Common: /sys/class/leds/xiaomi:rgb:status
-device = "/sys/class/leds/xiaomi:rgb:status"
+# Path to the LED sysfs device.
+# LX06 correct path: /sys/devices/i2c-0/0-003a/led_rgb
+device = "/sys/devices/i2c-0/0-003a/led_rgb"
+
+# Global brightness applied on top of colors (0-100)
+brightness = 60
 
 # Colors as RRGGBB hex strings
-# Idle: blue
-idle_color = "0000FF"
+# Idle: soft blue
+idle_color = "0000C8"
 # Listening: green
-listening_color = "00FF00"
+listening_color = "00C800"
 # Speaking: red
-speaking_color = "FF0000"
+speaking_color = "C80000"
 # Muted: magenta
-muted_color = "FF00FF"
+muted_color = "C800C8"
+# Thinking animation: purple
+thinking_color = "8000FF"
 
 
 # ------------------------------------------------------------
