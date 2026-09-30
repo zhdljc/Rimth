@@ -9,13 +9,14 @@
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
-use hound::{SampleFormat as HoundSampleFormat, WavSpec, WavWriter};
+use hound::{SampleFormat as HoundSampleFormat, WavReader, WavSpec, WavWriter};
 use reqwest::multipart;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::mpsc::{channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::RwLock;
@@ -29,12 +30,17 @@ const IP_API_URL: &str = "http://ip-api.com/json/?fields=status,country,countryC
 const CONFIG_FILE: &str = "Rimth.toml";
 
 const TTS_CHUNK_CHARS: usize = 180;
+const TTS_PREFETCH: usize = 2;
 const MIN_AUDIO_BYTES: usize = 44 + 16000 * 2 * 1;
 const LED_COUNT: usize = 18;
 const LED_FPS_MS: u64 = 33;
 const LED_MAX_CONSECUTIVE_FAILURES: u32 = 10;
+const LED_RECOVERY_MS: u64 = 5000;
+const CAPTURE_IDLE_TIMEOUT_SECS: u64 = 5;
 
 type SharedGroq = Arc<RwLock<GroqConfig>>;
+
+static OUTPUT_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -164,7 +170,7 @@ impl Default for Config {
                 tts_model: "canopylabs/orpheus-v1-english".into(),
                 tts_voice: "autumn".into(),
                 language: "en".into(),
-                system_prompt: "You are Rimth, a witty voice assistant on a speaker. Keep answers concise and conversational, with a light touch of humor. You can control volume, run terminal commands, fetch URLs, control the LED, set alarms, and switch models. Always reply in the user's language. Output plain prose only, no markdown, no tables, no emojis, because the reply will be spoken via TTS. If the user wants multiple alarms at different times, call set_alarm once per time.".into(),
+                system_prompt: "You are Rimth, a witty voice assistant on a speaker. Keep answers concise and conversational, with a light touch of humor. You can control volume, run terminal commands, fetch URLs, control the LED, set alarms, switch models, read your own conversation history, tell the time, report system info, stop your own speech, change the response language, and clear the session. Always reply in the user's language. Output plain prose only, no markdown, no tables, no emojis, because the reply will be spoken via TTS. If the user wants multiple alarms at different times, call set_alarm once per time.".into(),
                 stt_models_available: vec!["whisper-large-v3-turbo".into(), "whisper-large-v3".into()],
                 llm_models_available: vec![
                     "openai/gpt-oss-20b".into(), "openai/gpt-oss-120b".into(),
@@ -306,8 +312,6 @@ fn parse_rgb_hex_to_bgr(s: &str) -> Option<u32> {
 }
 
 /// The AW20054 sysfs driver processes exactly one LED per write syscall.
-/// Writing all 18 lines in one call only affects the first LED, so we
-/// issue 18 separate writes.
 fn write_leds(path: &str, colors: &[u32; LED_COUNT]) -> Result<()> {
     for (i, c) in colors.iter().enumerate() {
         let payload = format!("{} 0x{:06X}\n", i, c);
@@ -368,6 +372,7 @@ async fn led_worker(mut rx: UnboundedReceiver<LedCommand>, config: LedConfig) {
     let mut thinking = false;
     let mut thinking_phase: u32 = 0;
     let mut consecutive_failures: u32 = 0;
+    let mut skip_until: Option<std::time::Instant> = None;
 
     let idle_bgr = state_to_color(LedState::Idle, &config);
     for i in 0..LED_COUNT { target[i] = idle_bgr; }
@@ -414,6 +419,12 @@ async fn led_worker(mut rx: UnboundedReceiver<LedCommand>, config: LedConfig) {
                 }
             }
             _ = interval.tick() => {
+                if let Some(until) = skip_until {
+                    if std::time::Instant::now() < until { continue; }
+                    skip_until = None;
+                    consecutive_failures = 0;
+                }
+
                 if thinking {
                     thinking_phase = thinking_phase.wrapping_add(1);
                     let head = ((thinking_phase / 6) % LED_COUNT as u32) as i32;
@@ -443,9 +454,10 @@ async fn led_worker(mut rx: UnboundedReceiver<LedCommand>, config: LedConfig) {
                         Err(e) => {
                             consecutive_failures += 1;
                             if consecutive_failures == 1 { warn!("LED write failed: {}", e); }
-                            else if consecutive_failures >= LED_MAX_CONSECUTIVE_FAILURES {
-                                warn!("LED disabled after {} consecutive failures", consecutive_failures);
-                                return;
+                            if consecutive_failures >= LED_MAX_CONSECUTIVE_FAILURES {
+                                warn!("LED temporarily disabled after {} failures, retrying in {} ms",
+                                      consecutive_failures, LED_RECOVERY_MS);
+                                skip_until = Some(std::time::Instant::now() + Duration::from_millis(LED_RECOVERY_MS));
                             }
                         }
                     }
@@ -480,15 +492,25 @@ impl CaptureCtx {
         Ok(Self { inner: Arc::new(StdMutex::new(Some(stream))), tx, sample_rate, mic_gain })
     }
 
-    /// Drop the current input stream, wait for ALSA to release the device,
-    /// then create a fresh stream. Called after every TTS playback to
-    /// unblock the input side, which aplay's exclusive access suspends.
+    /// Drop the current input stream and create a fresh one. Used only as a
+    /// watchdog fallback: with cpal output the input side is not disturbed by
+    /// playback, so this normally never has to run.
     fn restart(&self) -> Result<()> {
         { let mut g = self.inner.lock().unwrap(); *g = None; }
-        std::thread::sleep(Duration::from_millis(60));
-        let new_stream = start_capture(self.tx.clone(), self.sample_rate, self.mic_gain.clone())?;
-        { let mut g = self.inner.lock().unwrap(); *g = Some(new_stream); }
-        Ok(())
+        let mut last_err: Option<anyhow::Error> = None;
+        for delay_ms in [80u64, 160, 320, 640] {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            match start_capture(self.tx.clone(), self.sample_rate, self.mic_gain.clone()) {
+                Ok(s) => {
+                    let mut g = self.inner.lock().unwrap();
+                    *g = Some(s);
+                    info!("Capture stream restarted");
+                    return Ok(());
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Capture restart failed")))
     }
 }
 
@@ -545,6 +567,11 @@ fn local_weekday() -> u8 {
     std::process::Command::new("date").arg("+%u").output().ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| s.trim().parse::<u8>().ok()).unwrap_or(0)
+}
+fn local_time_hms() -> String {
+    std::process::Command::new("date").arg("+%Y-%m-%d %H:%M:%S %Z").output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".into())
 }
 
 // ---------------------------------------------------------------------------
@@ -628,26 +655,41 @@ fn strip_markdown(text: &str) -> String {
     collapsed.trim().to_string()
 }
 
+/// Split long text into TTS-safe segments. Uses byte offsets tracked through
+/// the growing buffer so multi-byte characters never corrupt the boundary.
 fn split_text_for_tts(text: &str, max_chars: usize) -> Vec<String> {
-    let mut segments = Vec::new();
+    let mut segments: Vec<String> = Vec::new();
     let mut current = String::new();
+    let mut current_chars = 0usize;
+    let mut last_cut_byte: usize = 0;
+
     for c in text.chars() {
         current.push(c);
-        if current.chars().count() >= max_chars {
-            let cut_pos = current.rfind(|ch: char| matches!(ch, '。' | '！' | '？' | '.' | '!' | '?' | ';' | '；' | '\n' | '，' | ',' | ' '));
-            if let Some(pos) = cut_pos {
-                let byte_pos = current.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(current.len());
-                let end_byte = current[byte_pos..].chars().next().map(|ch| byte_pos + ch.len_utf8()).unwrap_or(byte_pos);
-                let (head, tail) = current.split_at(end_byte);
-                let head_trim = head.trim().to_string();
-                if !head_trim.is_empty() { segments.push(head_trim); }
-                current = tail.trim_start().to_string();
+        current_chars += 1;
+        if matches!(c, '。' | '！' | '？' | '.' | '!' | '?' | ';' | '；' | '\n' | '，' | ',' | ' ') {
+            last_cut_byte = current.len();
+        }
+        if current_chars >= max_chars {
+            let head: String;
+            let tail: String;
+            if last_cut_byte > 0 && last_cut_byte < current.len() {
+                head = current[..last_cut_byte].trim().to_string();
+                tail = current[last_cut_byte..].trim_start().to_string();
+            } else {
+                head = current.trim().to_string();
+                tail = String::new();
             }
+            if !head.is_empty() { segments.push(head); }
+            current = tail;
+            current_chars = current.chars().count();
+            last_cut_byte = 0;
         }
     }
     let tail = current.trim().to_string();
     if !tail.is_empty() { segments.push(tail); }
-    if segments.is_empty() { segments.push(text.trim().to_string()); }
+    if segments.is_empty() && !text.trim().is_empty() {
+        segments.push(text.trim().to_string());
+    }
     segments
 }
 
@@ -657,7 +699,14 @@ fn is_hallucination(text: &str) -> bool {
         "thanks for watching", "thank you for watching", "please subscribe", "subscribe to",
         "amara.org", "subtitle", "subtitles", "mbc", "kbs", "jtbc", "yoyo television", "mingshi",
     ];
-    patterns.iter().any(|p| lower.contains(p))
+    if patterns.iter().any(|p| lower.contains(p)) { return true; }
+    // CJK hallucination patterns
+    let cjk_patterns = [
+        "字幕由", "字幕组", "感谢观看", "请订阅", "订阅频道", "感谢大家观看",
+        "ご視聴ありがとう", "チャンネル登録", "ご視聴ありがとうございました",
+        "시청해주셔서 감사", "구독과 좋아요",
+    ];
+    cjk_patterns.iter().any(|p| text.contains(p))
 }
 
 fn detect_language(text: &str) -> &'static str {
@@ -702,7 +751,7 @@ fn build_system_prompt(user_prompt: &str, language: &str, config: &GroqConfig) -
     let tts_list = config.tts_models_available.join(", ");
     let voice_list = config.tts_voices_available.join(", ");
     format!(
-        "{}\n\nAlways reply in {}.\nDetect the language of the user's latest message and respond in that language, even if it differs from the configured language above.\nOutput plain prose only. Do NOT use markdown, tables, bullet points, headings, emojis, or code blocks, because the reply will be spoken through a text-to-speech engine.\nKeep the entire reply under 400 characters when possible.\n\nAvailable models you can switch to using the switch_model tool:\nSTT models: {}\nLLM models: {}\nTTS models: {}\nTTS voices: {}\n\nWhen the user asks to change a model, use the switch_model tool with the appropriate model_type (stt, llm, tts, voice) and model name. Do not just describe the change; actually call the tool.\nWhen the user asks to set an alarm, use the set_alarm tool. If the user wants multiple alarms at different times, call set_alarm once per time.\nWhen the user asks to control the LED, use the led_control tool.\nWhen the user wants to start a conversation mode (no wake word needed), use the conversation_mode tool with enabled=true. To exit, use enabled=false.\nWhen the user asks for a new session, use the session_control tool with action=new.\nWhen the user asks to mute or unmute the microphone, use the set_mute tool.",
+        "{}\n\nAlways reply in {}.\nDetect the language of the user's latest message and respond in that language, even if it differs from the configured language above.\nOutput plain prose only. Do NOT use markdown, tables, bullet points, headings, emojis, or code blocks, because the reply will be spoken through a text-to-speech engine.\nKeep the entire reply under 400 characters when possible.\n\nAvailable models you can switch to using the switch_model tool:\nSTT models: {}\nLLM models: {}\nTTS models: {}\nTTS voices: {}\n\nWhen the user asks to change a model, use the switch_model tool with the appropriate model_type (stt, llm, tts, voice) and model name. Do not just describe the change; actually call the tool.\nWhen the user asks to set an alarm, use the set_alarm tool. If the user wants multiple alarms at different times, call set_alarm once per time.\nWhen the user asks to control the LED, use the led_control tool.\nWhen the user wants to start a conversation mode (no wake word needed), use the conversation_mode tool with enabled=true. To exit, use enabled=false.\nWhen the user asks for a new session, use the session_control tool with action=new.\nWhen the user asks to mute or unmute the microphone, use the set_mute tool.\nWhen the user asks about what was said earlier, use the query_history tool.\nWhen the user asks the time or date, use the get_time tool.\nWhen the user asks for system status, use the get_system_info tool.\nWhen the user asks you to stop talking, use the stop_speaking tool.\nWhen the user asks you to respond in another language, use the set_language tool.\nWhen the user asks you to forget the conversation, use the clear_history tool.",
         user_prompt, lang_name, stt_list, llm_list, tts_list, voice_list
     )
 }
@@ -785,9 +834,15 @@ fn check_audio_devices(config: &AudioConfig) -> Vec<(&'static str, DiagnosticRes
         },
         None => results.push(("Input device", DiagnosticResult::Fail("No default input device".into()))),
     }
-    match std::process::Command::new("which").arg("aplay").output() {
-        Ok(out) if out.status.success() => results.push(("aplay", DiagnosticResult::Ok("available".into()))),
-        _ => results.push(("aplay", DiagnosticResult::Fail("aplay not found".into()))),
+    match host.default_output_device() {
+        Some(dev) => match dev.name() {
+            Ok(name) => match dev.default_output_config() {
+                Ok(cfg) => results.push(("Output device", DiagnosticResult::Ok(format!("'{}' ({} Hz, {} ch)", name, cfg.sample_rate().0, cfg.channels())))),
+                Err(e) => results.push(("Output device", DiagnosticResult::Warn(format!("'{}' query failed: {}", name, e)))),
+            },
+            Err(e) => results.push(("Output device", DiagnosticResult::Warn(format!("name unknown: {}", e)))),
+        },
+        None => results.push(("Output device", DiagnosticResult::Fail("No default output device".into()))),
     }
     match std::process::Command::new("amixer")
         .args(["-c", &config.card_index.to_string(), "get", &config.mixer_control]).output() {
@@ -887,7 +942,6 @@ async fn run_diagnostics(config: &Config, client: &reqwest::Client) -> bool {
             Err(e) => DiagnosticResult::Fail(format!("cannot resolve: {}", e)),
         }),
         ("amixer", check_binary("amixer")),
-        ("aplay", check_binary("aplay")),
         ("sh", check_binary("sh")),
         ("date", check_binary("date")),
         ("sounds dir", match sounds_dir() {
@@ -933,7 +987,7 @@ async fn run_diagnostics(config: &Config, client: &reqwest::Client) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Audio capture / playback
+// Audio capture
 // ---------------------------------------------------------------------------
 
 fn start_capture(tx: Sender<Vec<f32>>, sample_rate: u32, mic_gain: Arc<AtomicU32>) -> Result<Stream> {
@@ -971,21 +1025,43 @@ fn start_capture(tx: Sender<Vec<f32>>, sample_rate: u32, mic_gain: Arc<AtomicU32
     Ok(stream)
 }
 
-async fn wait_trigger(rx: &mut Receiver<Vec<f32>>, config: &AudioConfig, is_playing: &Arc<AtomicBool>, key_state: &KeyState) -> bool {
-    while let Some(chunk) = rx.recv().await {
-        if is_playing.load(Ordering::Relaxed) { continue; }
-        if key_state.muted.load(Ordering::Relaxed) { continue; }
-        if key_state.conversation_mode.load(Ordering::Relaxed) { return true; }
-        if rms(&chunk) > config.trigger_threshold {
-            info!("Volume trigger detected");
-            return true;
+async fn wait_trigger(
+    rx: &mut Receiver<Vec<f32>>,
+    config: &AudioConfig,
+    is_playing: &Arc<AtomicBool>,
+    key_state: &KeyState,
+    capture: &CaptureCtx,
+) -> Option<Vec<f32>> {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(CAPTURE_IDLE_TIMEOUT_SECS), rx.recv()).await {
+            Ok(Some(chunk)) => {
+                if is_playing.load(Ordering::Relaxed) { continue; }
+                if key_state.muted.load(Ordering::Relaxed) { continue; }
+                if key_state.conversation_mode.load(Ordering::Relaxed) { return Some(Vec::new()); }
+                if rms(&chunk) > config.trigger_threshold {
+                    info!("Volume trigger detected");
+                    return Some(chunk);
+                }
+            }
+            Ok(None) => return None,
+            Err(_) => {
+                warn!("No audio data for {}s, attempting capture restart", CAPTURE_IDLE_TIMEOUT_SECS);
+                if let Err(e) = capture.restart() {
+                    warn!("Capture restart failed: {}", e);
+                }
+            }
         }
     }
-    false
 }
 
-async fn record(rx: &mut Receiver<Vec<f32>>, config: &AudioConfig, is_playing: &Arc<AtomicBool>, key_state: &KeyState) -> Result<Option<Vec<u8>>> {
-    let mut samples: Vec<f32> = Vec::new();
+async fn record(
+    rx: &mut Receiver<Vec<f32>>,
+    config: &AudioConfig,
+    is_playing: &Arc<AtomicBool>,
+    key_state: &KeyState,
+    initial: Vec<f32>,
+) -> Result<Option<Vec<u8>>> {
+    let mut samples: Vec<f32> = initial;
     let mut silence: usize = 0;
     let silence_limit = config.sample_rate as usize * config.silence_duration_ms as usize / 1000;
     let min_samples = config.sample_rate as usize * config.min_recording_ms as usize / 1000;
@@ -1014,45 +1090,148 @@ async fn record(rx: &mut Receiver<Vec<f32>>, config: &AudioConfig, is_playing: &
     Ok(Some(cursor.into_inner()))
 }
 
-fn play_audio_bytes(bytes: Vec<u8>, stop_flag: &Arc<AtomicBool>) -> Result<()> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
+// ---------------------------------------------------------------------------
+// Audio playback (cpal based, shared device friendly)
+// ---------------------------------------------------------------------------
 
-    if stop_flag.load(Ordering::SeqCst) { stop_flag.store(false, Ordering::SeqCst); return Ok(()); }
-
-    let mut child = Command::new("aplay")
-        .arg("-q")
-        .arg("--period-size=1024")
-        .arg("--buffer-size=4096")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("Failed to spawn aplay")?;
-
-    let mut stdin = child.stdin.take().context("Failed to open aplay stdin")?;
-    if let Err(e) = stdin.write_all(&bytes) {
-        let _ = child.kill(); let _ = child.wait();
-        return Err(anyhow::Error::from(e).context("Failed to write to aplay stdin"));
-    }
-    drop(stdin);
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if stop_flag.load(Ordering::SeqCst) {
-                    let _ = child.kill(); let _ = child.wait();
-                    stop_flag.store(false, Ordering::SeqCst);
-                    info!("Playback stopped by key");
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(e) => { let _ = child.kill(); return Err(anyhow::Error::from(e).context("aplay wait failed")); }
+fn decode_wav(bytes: &[u8]) -> Result<(Vec<f32>, u32, u16)> {
+    let reader = WavReader::new(Cursor::new(bytes)).context("Invalid WAV")?;
+    let spec = reader.spec();
+    let samples: Vec<f32> = match spec.sample_format {
+        HoundSampleFormat::Int => {
+            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader.into_samples::<i32>()
+                .filter_map(|s| s.ok())
+                .map(|s| s as f32 / max)
+                .collect()
         }
+        HoundSampleFormat::Float => reader.into_samples::<f32>().filter_map(|s| s.ok()).collect(),
+    };
+    Ok((samples, spec.sample_rate, spec.channels))
+}
+
+fn play_audio_bytes(bytes: Vec<u8>, stop_flag: &Arc<AtomicBool>) -> Result<()> {
+    if stop_flag.load(Ordering::SeqCst) {
+        stop_flag.store(false, Ordering::SeqCst);
+        return Ok(());
     }
+
+    let _guard = OUTPUT_LOCK.lock().unwrap();
+
+    let (raw, in_rate, in_ch) = decode_wav(&bytes)?;
+    if raw.is_empty() { return Ok(()); }
+
+    let in_ch = in_ch as usize;
+
+    // Downmix to mono
+    let mono: Vec<f32> = if in_ch <= 1 {
+        raw
+    } else {
+        raw.chunks(in_ch).map(|c| c.iter().sum::<f32>() / in_ch as f32).collect()
+    };
+
+    let host = cpal::default_host();
+    let device = host.default_output_device().context("No default output device")?;
+    let default_cfg = device.default_output_config()?;
+    let out_rate = default_cfg.sample_rate().0;
+    let out_ch = default_cfg.channels() as usize;
+    let out_fmt = default_cfg.sample_format();
+
+    // Simple linear resample if needed
+    let resampled: Vec<f32> = if in_rate == out_rate {
+        mono
+    } else {
+        let ratio = out_rate as f64 / in_rate as f64;
+        let new_len = ((mono.len() as f64) * ratio) as usize;
+        let mut out = Vec::with_capacity(new_len);
+        for i in 0..new_len {
+            let src = i as f64 / ratio;
+            let i0 = src.floor() as usize;
+            let i1 = (i0 + 1).min(mono.len().saturating_sub(1));
+            let t = (src - i0 as f64) as f32;
+            let s0 = mono.get(i0).copied().unwrap_or(0.0);
+            let s1 = mono.get(i1).copied().unwrap_or(0.0);
+            out.push(s0 * (1.0 - t) + s1 * t);
+        }
+        out
+    };
+
+    let interleaved: Vec<f32> = if out_ch <= 1 {
+        resampled
+    } else {
+        let mut v = Vec::with_capacity(resampled.len() * out_ch);
+        for s in resampled {
+            for _ in 0..out_ch { v.push(s); }
+        }
+        v
+    };
+
+    let samples_arc = Arc::new(interleaved);
+    let pos = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicBool::new(false));
+
+    let stream_config = cpal::StreamConfig {
+        channels: out_ch as u16,
+        sample_rate: cpal::SampleRate(out_rate),
+        buffer_size: cpal::BufferSize::Default,
+    };
+
+    let s_cb = samples_arc.clone();
+    let p_cb = pos.clone();
+    let f_cb = finished.clone();
+
+    let err_fn = |e| eprintln!("output stream err: {}", e);
+
+    let stream = match out_fmt {
+        SampleFormat::F32 => device.build_output_stream(
+            &stream_config,
+            move |out: &mut [f32], _| {
+                let p = p_cb.load(Ordering::Relaxed);
+                let rem = s_cb.len().saturating_sub(p);
+                let n = out.len().min(rem);
+                out[..n].copy_from_slice(&s_cb[p..p + n]);
+                for s in &mut out[n..] { *s = 0.0; }
+                p_cb.store(p + n, Ordering::Relaxed);
+                if n < out.len() { f_cb.store(true, Ordering::Relaxed); }
+            },
+            err_fn, None,
+        )?,
+        SampleFormat::I16 => {
+            let i16_samples: Arc<Vec<i16>> = Arc::new(
+                s_cb.iter().map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16).collect()
+            );
+            let s_cb2 = i16_samples.clone();
+            device.build_output_stream(
+                &stream_config,
+                move |out: &mut [i16], _| {
+                    let p = p_cb.load(Ordering::Relaxed);
+                    let rem = s_cb2.len().saturating_sub(p);
+                    let n = out.len().min(rem);
+                    out[..n].copy_from_slice(&s_cb2[p..p + n]);
+                    for s in &mut out[n..] { *s = 0; }
+                    p_cb.store(p + n, Ordering::Relaxed);
+                    if n < out.len() { f_cb.store(true, Ordering::Relaxed); }
+                },
+                err_fn, None,
+            )?
+        }
+        f => return Err(anyhow::anyhow!("Unsupported output format: {:?}", f)),
+    };
+
+    stream.play()?;
+
+    while !finished.load(Ordering::Relaxed) {
+        if stop_flag.load(Ordering::SeqCst) {
+            stop_flag.store(false, Ordering::SeqCst);
+            info!("Playback stopped by key");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    drop(stream);
+    // Small tail so the hardware finishes the last buffer
+    std::thread::sleep(Duration::from_millis(60));
     Ok(())
 }
 
@@ -1127,10 +1306,9 @@ async fn stt(client: &reqwest::Client, config: &GroqConfig, wav: Vec<u8>) -> Res
 }
 
 async fn tts(client: &reqwest::Client, config: &GroqConfig, text: &str, voice: &str) -> Result<Vec<u8>> {
-    let single: String = text.chars().take(TTS_CHUNK_CHARS).collect();
     let body = serde_json::json!({
         "model": config.tts_model,
-        "input": single,
+        "input": text,
         "voice": voice,
         "response_format": "wav"
     });
@@ -1223,7 +1401,25 @@ fn tools_definition() -> serde_json::Value {
             "parameters": {"type": "object", "properties": {}, "required": []}}},
         {"type": "function", "function": {"name": "set_mute",
             "description": "Toggle or set the microphone mute state.",
-            "parameters": {"type": "object", "properties": {"muted": {"type": "boolean"}}, "required": ["muted"]}}}
+            "parameters": {"type": "object", "properties": {"muted": {"type": "boolean"}}, "required": ["muted"]}}},
+        {"type": "function", "function": {"name": "query_history",
+            "description": "Return the most recent turns of the current conversation. Use this when the user asks what was said earlier or wants a recap.",
+            "parameters": {"type": "object", "properties": {"count": {"type": "integer"}}, "required": []}}},
+        {"type": "function", "function": {"name": "clear_history",
+            "description": "Forget the current conversation, keeping only the system prompt.",
+            "parameters": {"type": "object", "properties": {}, "required": []}}},
+        {"type": "function", "function": {"name": "get_time",
+            "description": "Get the current local date and time.",
+            "parameters": {"type": "object", "properties": {}, "required": []}}},
+        {"type": "function", "function": {"name": "get_system_info",
+            "description": "Get basic device information: uptime, load average and memory usage.",
+            "parameters": {"type": "object", "properties": {}, "required": []}}},
+        {"type": "function", "function": {"name": "stop_speaking",
+            "description": "Stop the current speech playback immediately.",
+            "parameters": {"type": "object", "properties": {}, "required": []}}},
+        {"type": "function", "function": {"name": "set_language",
+            "description": "Change the STT and reply language code (e.g. en, zh, ja, ko, es).",
+            "parameters": {"type": "object", "properties": {"language": {"type": "string"}}, "required": ["language"]}}}
     ])
 }
 
@@ -1241,7 +1437,15 @@ async fn amixer_set(config: &AudioConfig, percent: u32) -> Result<u32> {
     Ok(clamped)
 }
 
-async fn execute_tool(client: &reqwest::Client, audio_config: &AudioConfig, alarm_config: &AlarmConfig, state: &Arc<AppState>, name: &str, args: &str) -> String {
+async fn execute_tool(
+    client: &reqwest::Client,
+    audio_config: &AudioConfig,
+    alarm_config: &AlarmConfig,
+    config: &Config,
+    state: &Arc<AppState>,
+    name: &str,
+    args: &str,
+) -> String {
     match name {
         "set_volume" => {
             let parsed: serde_json::Value = match serde_json::from_str(args) { Ok(v) => v, Err(e) => return format!("Parse failed: {}", e) };
@@ -1295,7 +1499,11 @@ async fn execute_tool(client: &reqwest::Client, audio_config: &AudioConfig, alar
                 Err(e) => format!("Failed: {}", e),
             }
         }
-        "run_diagnostics" => "Diagnostics requested, see console output".into(),
+        "run_diagnostics" => {
+            let ok = run_diagnostics(config, client).await;
+            if ok { "Diagnostics finished with no failures".into() }
+            else { "Diagnostics finished with failures, check console".into() }
+        }
         "switch_model" => {
             let parsed: serde_json::Value = match serde_json::from_str(args) { Ok(v) => v, Err(e) => return format!("Parse failed: {}", e) };
             let model_type = parsed["model_type"].as_str().unwrap_or("");
@@ -1340,7 +1548,7 @@ async fn execute_tool(client: &reqwest::Client, audio_config: &AudioConfig, alar
             if let Some(color) = parsed["color"].as_str() {
                 if parse_rgb_hex_to_bgr(color).is_some() {
                     if let Some(idx) = parsed["index"].as_i64() {
-                        if idx >= 0 && idx < LED_COUNT as i64 {
+                        if (0..LED_COUNT as i64).contains(&idx) {
                             state.led.send(LedCommand::SetOneHex(idx as usize, color.to_string()));
                             actions.push(format!("LED {} = #{}", idx, color));
                         } else {
@@ -1370,14 +1578,56 @@ async fn execute_tool(client: &reqwest::Client, audio_config: &AudioConfig, alar
             let parsed: serde_json::Value = match serde_json::from_str(args) { Ok(v) => v, Err(e) => return format!("Parse failed: {}", e) };
             let action = parsed["action"].as_str().unwrap_or("list");
             match action {
-                "new" => format!("New session created: session_{}", rand::random::<u16>()),
+                "new" => {
+                    let requested = parsed["session_name"].as_str().unwrap_or("").trim();
+                    let new_name = if requested.is_empty() {
+                        format!("session_{}", rand::random::<u16>())
+                    } else {
+                        requested.to_string()
+                    };
+                    {
+                        let mut cur = state.current_session.lock().unwrap();
+                        // Persist current session before switching
+                        let msgs = state.messages.lock().unwrap().clone();
+                        save_session(&state.sessions_dir, &cur, &msgs);
+                        *cur = new_name.clone();
+                    }
+                    {
+                        let mut msgs = state.messages.lock().unwrap();
+                        msgs.clear();
+                        msgs.push(ChatMessage::system(state.effective_system.lock().unwrap().clone()));
+                    }
+                    info!("Started new session: {}", new_name);
+                    format!("New session started: {}", new_name)
+                }
                 "list" => {
                     let sessions = list_sessions(&state.sessions_dir);
                     if sessions.is_empty() { "No sessions".into() } else { format!("Sessions: {}", sessions.join(", ")) }
                 }
                 "switch" => {
-                    let name = parsed["session_name"].as_str().unwrap_or("");
-                    if name.is_empty() { "No session name provided".into() } else { format!("Switched to session: {}", name) }
+                    let name = parsed["session_name"].as_str().unwrap_or("").trim().to_string();
+                    if name.is_empty() { return "No session name provided".into(); }
+                    let sessions = list_sessions(&state.sessions_dir);
+                    if !sessions.contains(&name) {
+                        return format!("Session '{}' not found. Available: {}", name, sessions.join(", "));
+                    }
+                    // Save current session before switching
+                    {
+                        let mut cur = state.current_session.lock().unwrap();
+                        let msgs = state.messages.lock().unwrap().clone();
+                        save_session(&state.sessions_dir, &cur, &msgs);
+                        *cur = name.clone();
+                    }
+                    let mut loaded = load_session(&state.sessions_dir, &name);
+                    if loaded.is_empty() || loaded[0].role != "system" {
+                        loaded.insert(0, ChatMessage::system(state.effective_system.lock().unwrap().clone()));
+                    }
+                    {
+                        let mut msgs = state.messages.lock().unwrap();
+                        *msgs = loaded;
+                    }
+                    info!("Switched to session: {}", name);
+                    format!("Switched to session: {}", name)
                 }
                 _ => "Unknown session action".into(),
             }
@@ -1399,6 +1649,67 @@ async fn execute_tool(client: &reqwest::Client, audio_config: &AudioConfig, alar
             state.key_state.muted.store(muted, Ordering::SeqCst);
             if muted { state.led.send(LedCommand::SetState(LedState::Muted)); "Microphone muted".into() }
             else { state.led.send(LedCommand::SetState(LedState::Idle)); "Microphone unmuted".into() }
+        }
+        "query_history" => {
+            let parsed: serde_json::Value = serde_json::from_str(args).unwrap_or(serde_json::json!({}));
+            let count = parsed["count"].as_u64().unwrap_or(8).clamp(1, 30) as usize;
+            let msgs = state.messages.lock().unwrap().clone();
+            let recent: Vec<String> = msgs.iter()
+                .filter(|m| m.role == "user" || m.role == "assistant")
+                .filter_map(|m| {
+                    let content = m.content.as_deref().unwrap_or("").trim();
+                    if content.is_empty() { None }
+                    else { Some(format!("{}: {}", m.role, content)) }
+                })
+                .collect();
+            if recent.is_empty() { "No conversation history yet.".into() }
+            else {
+                let start = recent.len().saturating_sub(count);
+                recent[start..].join("\n")
+            }
+        }
+        "clear_history" => {
+            {
+                let mut msgs = state.messages.lock().unwrap();
+                msgs.clear();
+                msgs.push(ChatMessage::system(state.effective_system.lock().unwrap().clone()));
+            }
+            let cur = state.current_session.lock().unwrap().clone();
+            let msgs = state.messages.lock().unwrap().clone();
+            save_session(&state.sessions_dir, &cur, &msgs);
+            "Conversation history cleared.".into()
+        }
+        "get_time" => local_time_hms(),
+        "get_system_info" => {
+            let uptime = std::fs::read_to_string("/proc/uptime")
+                .ok()
+                .and_then(|s| s.split_whitespace().next().map(|x| x.to_string()))
+                .map(|s| format!("{:.0}s", s.parse::<f64>().unwrap_or(0.0)))
+                .unwrap_or_else(|| "unknown".into());
+            let loadavg = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+            let load = loadavg.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+            let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+            let total_kb = meminfo.lines().find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1)).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            let avail_kb = meminfo.lines().find(|l| l.starts_with("MemAvailable:"))
+                .and_then(|l| l.split_whitespace().nth(1)).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            format!("Uptime {}s, load {}, memory {}/{} MB used",
+                    uptime, load, (total_kb - avail_kb) / 1024, total_kb / 1024)
+        }
+        "stop_speaking" => {
+            state.key_state.stop_playback.store(true, Ordering::SeqCst);
+            "Stopping playback".into()
+        }
+        "set_language" => {
+            let parsed: serde_json::Value = match serde_json::from_str(args) { Ok(v) => v, Err(e) => return format!("Parse failed: {}", e) };
+            let lang = parsed["language"].as_str().unwrap_or("en").trim().to_lowercase();
+            if lang.is_empty() { return "Empty language code".into(); }
+            {
+                let mut cfg = state.groq.write().await;
+                cfg.language = lang.clone();
+            }
+            info!("Language switched to {}", lang);
+            format!("Language set to {}", lang)
         }
         _ => format!("Unknown tool: {}", name),
     }
@@ -1461,6 +1772,23 @@ fn list_sessions(dir: &PathBuf) -> Vec<String> {
     names
 }
 
+/// Trim history without breaking tool_call / tool pairing.
+fn trim_history(messages: &mut Vec<ChatMessage>, max: usize) {
+    if messages.len() <= max + 1 { return; }
+    let mut remove_count = messages.len() - max - 1;
+    while remove_count > 0 && messages.len() > 2 {
+        let can_remove = {
+            let m = &messages[1];
+            if m.role == "tool" { false }
+            else if m.role == "assistant" && m.tool_calls.is_some() { false }
+            else { true }
+        };
+        if !can_remove { break; }
+        messages.remove(1);
+        remove_count -= 1;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Speak
 // ---------------------------------------------------------------------------
@@ -1473,7 +1801,6 @@ async fn speak(
     stop_playback: &Arc<AtomicBool>,
     rx: &mut Receiver<Vec<f32>>,
     led: &LedHandle,
-    capture: &CaptureCtx,
 ) {
     let cleaned = strip_markdown(text);
     if cleaned.trim().is_empty() {
@@ -1482,8 +1809,8 @@ async fn speak(
     }
 
     let lang = detect_language(&cleaned);
-    let (tts_model, tts_voice) = choose_tts_for_language(lang, config);
-    info!("TTS language={}, model={}, voice={}", lang, tts_model, tts_voice);
+    let (_tts_model, tts_voice) = choose_tts_for_language(lang, config);
+    info!("TTS language={}, voice={}", lang, tts_voice);
 
     let segments = split_text_for_tts(&cleaned, TTS_CHUNK_CHARS);
     info!("TTS: {} segment(s)", segments.len());
@@ -1492,45 +1819,65 @@ async fn speak(
     while rx.try_recv().is_ok() {}
     led.send(LedCommand::SetState(LedState::Speaking));
 
-    for (i, seg) in segments.iter().enumerate() {
+    let cfg_snapshot = config.clone();
+    let mut handles: VecDeque<tokio::task::JoinHandle<Result<Vec<u8>>>> = VecDeque::new();
+
+    // Prime the pipeline
+    let prefetch = TTS_PREFETCH.min(segments.len());
+    for i in 0..prefetch {
+        let seg = segments[i].clone();
+        let cl = client.clone();
+        let cfg = cfg_snapshot.clone();
+        let v = tts_voice.clone();
+        handles.push_back(tokio::spawn(async move { tts(&cl, &cfg, &seg, &v).await }));
+    }
+
+    for i in 0..segments.len() {
         if stop_playback.load(Ordering::SeqCst) {
             stop_playback.store(false, Ordering::SeqCst);
             info!("Playback cancelled before segment {}", i + 1);
             break;
         }
-        let cfg_snapshot = config.clone();
-        match tts(client, &cfg_snapshot, seg, &tts_voice).await {
-            Ok(audio) => {
-                let stop = stop_playback.clone();
-                if let Err(e) = tokio::task::spawn_blocking(move || play_audio_bytes(audio, &stop)).await {
-                    error!("Playback failed: {}", e);
-                    break;
-                }
-            }
-            Err(e) => {
+
+        // Prefetch the next unseen segment
+        let next_i = i + TTS_PREFETCH;
+        if next_i < segments.len() {
+            let seg = segments[next_i].clone();
+            let cl = client.clone();
+            let cfg = cfg_snapshot.clone();
+            let v = tts_voice.clone();
+            handles.push_back(tokio::spawn(async move { tts(&cl, &cfg, &seg, &v).await }));
+        }
+
+        let handle = match handles.pop_front() {
+            Some(h) => h,
+            None => break,
+        };
+
+        let audio = match handle.await {
+            Ok(Ok(a)) => a,
+            Ok(Err(e)) => {
                 error!("TTS segment {} failed: {}", i + 1, e);
                 play_prompt(Prompt::Network, stop_playback).await;
                 break;
             }
+            Err(e) => {
+                error!("TTS join failed: {}", e);
+                break;
+            }
+        };
+
+        let stop = stop_playback.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || play_audio_bytes(audio, &stop)).await {
+            error!("Playback failed: {}", e);
+            break;
         }
     }
 
-    // Drain any audio captured while we were playing. is_playing is still
-    // true here so the main loop drops chunks anyway; we just clear them.
-    while rx.try_recv().is_ok() {}
-
-    // Restart the input stream to unblock ALSA. aplay's exclusive access
-    // suspends the cpal input side, and dropping/recreating the stream
-    // forces ALSA to fully release the output device and reopen capture.
-    if let Err(e) = capture.restart() {
-        warn!("Capture restart failed: {}", e);
-    }
-
-    // Drain again to remove any stale data from before the restart.
+    // Drain anything that arrived while we were playing
     while rx.try_recv().is_ok() {}
 
     is_playing.store(false, Ordering::SeqCst);
-
     led.send(LedCommand::SetState(LedState::Idle));
 }
 
@@ -1578,6 +1925,11 @@ async fn alarm_watcher(ctx: AlarmContext) {
         if dirty { save_alarms(&ctx.store_path, &alarms); }
 
         for (id, time, label) in to_fire {
+            // Wait for any ongoing main-loop playback to finish
+            while ctx.is_playing.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+
             let msg = if label.trim().is_empty() { format!("Alarm at {}", time) } else { format!("Alarm at {}: {}", time, label) };
             info!("Alarm firing ({}): {}", id, msg);
             ctx.led.send(LedCommand::SetState(LedState::Alarm));
@@ -1912,6 +2264,9 @@ struct AppState {
     mic_gain: Arc<AtomicU32>,
     led: LedHandle,
     groq: SharedGroq,
+    messages: StdMutex<Vec<ChatMessage>>,
+    current_session: StdMutex<String>,
+    effective_system: StdMutex<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1970,12 +2325,12 @@ async fn main() -> Result<()> {
         build_system_prompt(&cfg.system_prompt, &cfg.language, &cfg)
     };
 
-    let mut current_session = "default".to_string();
-    let mut messages: Vec<ChatMessage> = load_session(&sessions_dir, &current_session);
-    if messages.is_empty() || messages[0].role != "system" {
-        messages.insert(0, ChatMessage::system(effective_system.clone()));
+    let current_session = "default".to_string();
+    let mut initial_messages: Vec<ChatMessage> = load_session(&sessions_dir, &current_session);
+    if initial_messages.is_empty() || initial_messages[0].role != "system" {
+        initial_messages.insert(0, ChatMessage::system(effective_system.clone()));
     } else {
-        messages[0].content = Some(effective_system.clone());
+        initial_messages[0].content = Some(effective_system.clone());
     }
 
     let is_playing = Arc::new(AtomicBool::new(false));
@@ -1988,6 +2343,9 @@ async fn main() -> Result<()> {
         mic_gain: mic_gain.clone(),
         led: led.clone(),
         groq: groq.clone(),
+        messages: StdMutex::new(initial_messages),
+        current_session: StdMutex::new(current_session.clone()),
+        effective_system: StdMutex::new(effective_system.clone()),
     });
 
     {
@@ -2018,21 +2376,25 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        if key_state.conversation_mode.load(Ordering::Relaxed) {
+        let trigger_chunk = if key_state.conversation_mode.load(Ordering::Relaxed) {
             info!("Conversation mode active, listening...");
             led.send(LedCommand::SetState(LedState::Listening));
             tokio::time::sleep(Duration::from_millis(300)).await;
             while rx.try_recv().is_ok() {}
+            Vec::new()
         } else {
-            if !wait_trigger(&mut rx, &config.audio, &is_playing, &key_state).await { continue; }
-            led.send(LedCommand::SetState(LedState::Listening));
-        }
+            match wait_trigger(&mut rx, &config.audio, &is_playing, &key_state, &capture).await {
+                Some(c) => c,
+                None => continue,
+            }
+        };
+        led.send(LedCommand::SetState(LedState::Listening));
 
         let api_key_now = groq.read().await.api_key.clone();
         if api_key_now.trim().is_empty() { warn!("API key not set, skipping"); continue; }
 
         info!("Recording...");
-        let wav_opt = match record(&mut rx, &config.audio, &is_playing, &key_state).await {
+        let wav_opt = match record(&mut rx, &config.audio, &is_playing, &key_state, trigger_chunk).await {
             Ok(w) => w,
             Err(e) => { error!("Record failed: {}", e); continue; }
         };
@@ -2080,20 +2442,47 @@ async fn main() -> Result<()> {
             let ok = run_diagnostics(&config, &client).await;
             let reply = if ok { "Diagnostics passed." } else { "Diagnostics found problems." };
             let cfg = groq.read().await.clone();
-            speak(&client, &cfg, reply, &is_playing, &key_state.stop_playback, &mut rx, &led, &capture).await;
+            speak(&client, &cfg, reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
             continue;
+        }
+
+        // Regenerate the system prompt every turn so model / language changes
+        // are reflected immediately.
+        let effective_system = {
+            let cfg = groq.read().await;
+            build_system_prompt(&cfg.system_prompt, &cfg.language, &cfg)
+        };
+        {
+            let mut sys = app_state.effective_system.lock().unwrap();
+            *sys = effective_system.clone();
+        }
+        {
+            let mut msgs = app_state.messages.lock().unwrap();
+            if msgs.is_empty() || msgs[0].role != "system" {
+                msgs.insert(0, ChatMessage::system(effective_system.clone()));
+            } else {
+                msgs[0].content = Some(effective_system.clone());
+            }
         }
 
         if lower.starts_with("new session") {
             let name = lower.trim_start_matches("new session").trim().to_string();
             let name = if name.is_empty() { format!("session_{}", rand::random::<u16>()) } else { name };
-            current_session = name;
-            messages = vec![ChatMessage::system(effective_system.clone())];
-            save_session(&sessions_dir, &current_session, &messages);
-            let reply = format!("New session: {}", current_session);
+            {
+                let mut cur = app_state.current_session.lock().unwrap();
+                let msgs = app_state.messages.lock().unwrap().clone();
+                save_session(&sessions_dir, &cur, &msgs);
+                *cur = name.clone();
+            }
+            {
+                let mut msgs = app_state.messages.lock().unwrap();
+                msgs.clear();
+                msgs.push(ChatMessage::system(effective_system.clone()));
+            }
+            let reply = format!("New session: {}", name);
             info!("{}", reply);
             let cfg = groq.read().await.clone();
-            speak(&client, &cfg, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led, &capture).await;
+            speak(&client, &cfg, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
             continue;
         }
 
@@ -2106,18 +2495,27 @@ async fn main() -> Result<()> {
                 else { format!("Sessions: {}", sessions.join(", ")) };
                 info!("{}", reply);
                 let cfg = groq.read().await.clone();
-                speak(&client, &cfg, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led, &capture).await;
+                speak(&client, &cfg, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
                 continue;
             }
-            current_session = name;
-            messages = load_session(&sessions_dir, &current_session);
-            if messages.is_empty() || messages[0].role != "system" {
-                messages.insert(0, ChatMessage::system(effective_system.clone()));
+            {
+                let mut cur = app_state.current_session.lock().unwrap();
+                let msgs = app_state.messages.lock().unwrap().clone();
+                save_session(&sessions_dir, &cur, &msgs);
+                *cur = name.clone();
             }
-            let reply = format!("Resumed: {}", current_session);
+            let mut loaded = load_session(&sessions_dir, &name);
+            if loaded.is_empty() || loaded[0].role != "system" {
+                loaded.insert(0, ChatMessage::system(effective_system.clone()));
+            }
+            {
+                let mut msgs = app_state.messages.lock().unwrap();
+                *msgs = loaded;
+            }
+            let reply = format!("Resumed: {}", name);
             info!("{}", reply);
             let cfg = groq.read().await.clone();
-            speak(&client, &cfg, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led, &capture).await;
+            speak(&client, &cfg, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
             continue;
         }
 
@@ -2127,15 +2525,15 @@ async fn main() -> Result<()> {
             else { format!("Sessions: {}", sessions.join(", ")) };
             info!("{}", reply);
             let cfg = groq.read().await.clone();
-            speak(&client, &cfg, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led, &capture).await;
+            speak(&client, &cfg, &reply, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
             continue;
         }
 
-        messages.push(ChatMessage::user(user_text.clone()));
-        let max = config.session.max_history;
-        if messages.len() > max + 1 {
-            let remove_count = messages.len() - max - 1;
-            messages.drain(1..1 + remove_count);
+        // Push user message and trim
+        {
+            let mut msgs = app_state.messages.lock().unwrap();
+            msgs.push(ChatMessage::user(user_text.clone()));
+            trim_history(&mut msgs, config.session.max_history);
         }
 
         info!("Thinking...");
@@ -2145,15 +2543,29 @@ async fn main() -> Result<()> {
 
         for _ in 0..5 {
             let cfg = groq.read().await.clone();
-            match chat(&client, &cfg, &messages, Some(tools.clone())).await {
+            let msgs_snapshot: Vec<ChatMessage> = {
+                let msgs = app_state.messages.lock().unwrap();
+                msgs.clone()
+            };
+
+            match chat(&client, &cfg, &msgs_snapshot, Some(tools.clone())).await {
                 Ok(response) => {
                     if let Some(tool_calls) = &response.tool_calls {
                         if !tool_calls.is_empty() {
-                            messages.push(ChatMessage::assistant(response.content.clone(), Some(tool_calls.clone())));
+                            {
+                                let mut msgs = app_state.messages.lock().unwrap();
+                                msgs.push(ChatMessage::assistant(response.content.clone(), Some(tool_calls.clone())));
+                            }
                             for tc in tool_calls {
-                                let result = execute_tool(&client, &config.audio, &config.alarm, &app_state, &tc.function.name, &tc.function.arguments).await;
+                                let result = execute_tool(
+                                    &client, &config.audio, &config.alarm, &config,
+                                    &app_state, &tc.function.name, &tc.function.arguments
+                                ).await;
                                 info!("Tool ({}): {}", tc.function.name, result);
-                                messages.push(ChatMessage::tool(tc.id.clone(), tc.function.name.clone(), result));
+                                {
+                                    let mut msgs = app_state.messages.lock().unwrap();
+                                    msgs.push(ChatMessage::tool(tc.id.clone(), tc.function.name.clone(), result));
+                                }
                             }
                             continue;
                         }
@@ -2170,9 +2582,11 @@ async fn main() -> Result<()> {
                     else { Prompt::Server };
                     led.send(LedCommand::StopThinking);
                     play_prompt(p, &key_state.stop_playback).await;
-                    if msg.contains("Tools should have a name") {
-                        warn!("History corrupted (harmony encoding). Trimming tool messages.");
-                        messages = sanitize_session(messages);
+                    if msg.contains("Tools should have a name") || msg.contains("tool_call_id") {
+                        warn!("History corrupted, sanitizing");
+                        let mut msgs = app_state.messages.lock().unwrap();
+                        let cleaned = sanitize_session(msgs.clone());
+                        *msgs = cleaned;
                     }
                     break;
                 }
@@ -2183,11 +2597,21 @@ async fn main() -> Result<()> {
 
         if assistant_text.trim().is_empty() { continue; }
         info!("Assistant: {}", assistant_text);
-        messages.push(ChatMessage::assistant(Some(assistant_text.clone()), None));
-        save_session(&sessions_dir, &current_session, &messages);
+        {
+            let mut msgs = app_state.messages.lock().unwrap();
+            msgs.push(ChatMessage::assistant(Some(assistant_text.clone()), None));
+            trim_history(&mut msgs, config.session.max_history);
+        }
+
+        // Persist
+        {
+            let cur = app_state.current_session.lock().unwrap().clone();
+            let msgs = app_state.messages.lock().unwrap().clone();
+            save_session(&sessions_dir, &cur, &msgs);
+        }
 
         info!("Synthesizing...");
         let cfg = groq.read().await.clone();
-        speak(&client, &cfg, &assistant_text, &is_playing, &key_state.stop_playback, &mut rx, &led, &capture).await;
+        speak(&client, &cfg, &assistant_text, &is_playing, &key_state.stop_playback, &mut rx, &led).await;
     }
 }
