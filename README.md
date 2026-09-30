@@ -2,8 +2,8 @@
 
 > Turn a locked-down XiaoAi speaker into a AI voice assistant powered by Groq.
 
-**Rimth** is an open-source voice assistant written in Rust, designed for the **XiaoAi Speaker LX06** (and similar models). By replacing the stock firmware, it connects the speaker to Groq's Whisper STT, GPT-OSS LLM, and Orpheus TTS for low-latency, customizable, privacy-friendly voice interaction.
-
+**Rimth** is an open-source voice assistant written in Rust, designed for the **XiaoAi Speaker LX06** (and similar models). By replacing the stock firmware, it connects the speaker to Groq's Whisper STT, GPT-OSS LLM, and Orpheus TTS for low-latency, customizable, interaction.
+**Please note, README.md might also have errors. Be sure to carefully check that your actions are correct before executing. The contents of this README.md may not be applicable, and pay attention to the accuracy, safety, and compatibility of external resources (like links) in the README.md. We do not guarantee that the README.md is correct.**
 ## Features
 
 - Voice-activated recording using RMS-based VAD, with auto-stop on silence
@@ -250,7 +250,7 @@ ssh root@<speaker-ip> "cd /data/rimth && chmod +x Rimth && ./Rimth"
 - A Linux host for cross-compilation (Fedora recommended)
 
 ## Build
-
+Please note that the GLIBC version and architecture requirements for compiling the project are complicated, so you need to use Docker. The Cross.toml and Dockerfile in the project are necessary configurations for compilation, and make sure to run cross in the root directory of the full project, otherwise it will give errors or won't work.
 ```bash
 rustup target add armv7-unknown-linux-gnueabihf
 
@@ -261,6 +261,20 @@ cross build --release --target armv7-unknown-linux-gnueabihf
 # Or using cargo-zigbuild
 cargo install cargo-zigbuild
 cargo zigbuild --release --target armv7-unknown-linux-gnueabihf
+```
+ - Like this
+```terminaloutput
+❯ cross build --release --target armv7-unknown-linux-gnueabihf
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+
+  stable-x86_64-unknown-linux-gnu unchanged - rustc 1.98.1 (48a229cea 2026-09-01)
+
+info: checking for self-update (current version: 1.29.1)
+[HIDE]
+ => => naming to docker.io/library/cross-custom-rimth:armv7-unknown-linux-gnueabihf-1abce-pre-build                                                          0.0s 
+ => => unpacking to docker.io/library/cross-custom-rimth:armv7-unknown-linux-gnueabihf-1abce-pre-build                                                       0.0s 
+   Compiling Rimth v0.1.0 (/project)                                                                                                                              
+    Finished `release` profile [optimized] target(s) in -
 ```
 
 The binary is produced at `target/armv7-unknown-linux-gnueabihf/release/Rimth`.
